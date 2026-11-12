@@ -1,0 +1,97 @@
+name: Build and publish Zarya OS
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the leading v (for example 1.0.1)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Select and validate version
+        id: meta
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            [[ "$GITHUB_REF_NAME" == v* ]] || { echo 'Release tags must start with v' >&2; exit 1; }
+          else
+            version="$VERSION_INPUT"
+          fi
+          [[ "$version" =~ ^[0-9][A-Za-z0-9.+~-]*$ ]] || { echo "Invalid version: $version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install ISO build tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            debootstrap squashfs-tools xorriso grub-pc-bin grub-efi-amd64-bin \
+            grub-common mtools dosfstools cpio kmod ca-certificates zstd openssl
+
+      - name: Build live ISO
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          sudo env \
+            ZARYA_VERSION="$VERSION" \
+            ZARYA_WORKDIR="$RUNNER_TEMP/zarya-build" \
+            ZARYA_OUT="$GITHUB_WORKSPACE/release/zarya-os-$VERSION-amd64.iso" \
+            bash packaging/build-iso.sh
+
+      - name: Build signed OTA bundle when signing key is configured
+        id: package
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          ZARYA_OTA_SIGNING_KEY: ${{ secrets.ZARYA_OTA_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ZARYA_OTA_SIGNING_KEY" ]; then
+            echo 'ota_enabled=false' >> "$GITHUB_OUTPUT"
+            echo 'note=ISO published; signed OTA bundle omitted because repository secret ZARYA_OTA_SIGNING_KEY is not configured.' >> "$GITHUB_OUTPUT"
+            echo '::warning::Set the repository Actions secret ZARYA_OTA_SIGNING_KEY and rerun this workflow to publish OTA updates.'
+          else
+            key="$RUNNER_TEMP/zarya-ota-signing.pem"
+            trap 'rm -f "$key"' EXIT
+            umask 077
+            printf '%s\n' "$ZARYA_OTA_SIGNING_KEY" > "$key"
+            sudo bash packaging/ota/build-update.sh \
+              "$RUNNER_TEMP/zarya-build/rootfs" "$VERSION" "$key" "$GITHUB_WORKSPACE/release"
+            echo 'ota_enabled=true' >> "$GITHUB_OUTPUT"
+            echo 'note=Signed A/B OTA bundle included. Verify downloaded files with SHA256SUMS.' >> "$GITHUB_OUTPUT"
+          fi
+          sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE/release"
+          (cd release && sha256sum "zarya-os-$VERSION-amd64.iso" > SHA256SUMS)
+          if [ -f "release/zarya-os-$VERSION-amd64.zup" ]; then
+            (cd release && sha256sum "zarya-os-$VERSION-amd64.zup" >> SHA256SUMS)
+          fi
+
+      - name: Publish ISO and available signed updates
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Zarya OS ${{ steps.meta.outputs.version }}
+          body: ${{ steps.package.outputs.note }}
+          fail_on_unmatched_files: true
+          files: release/*

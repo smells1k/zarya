@@ -1,0 +1,56 @@
+name: Validate source
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install static validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y grub-common shellcheck
+      - name: Check shell script syntax
+        run: |
+          set -euo pipefail
+          bash -n packaging/build-iso.sh
+          bash -n packaging/make-shell-deb.sh
+          bash -n packaging/ota/build-update.sh
+          bash -n packaging/ota/zarya-update
+          bash -n packaging/ota/zarya-ota-init
+          bash -n packaging/install/zarya-install
+          sh -n packaging/system/zarya-session
+          sh -n packaging/wine/zarya-wine
+          shellcheck packaging/build-iso.sh packaging/make-shell-deb.sh \
+            packaging/ota/build-update.sh packaging/ota/zarya-update \
+            packaging/ota/zarya-ota-init packaging/install/zarya-install \
+            packaging/system/zarya-session packaging/wine/zarya-wine
+      - name: Compile Python sources
+        run: python3 -m py_compile shell/*.py dev/snap_desktop.py
+      - name: Check GRUB configuration syntax
+        run: |
+          grub-script-check boot/grub.cfg
+          grub-script-check packaging/ota/grub-ab.cfg
+      - name: Verify installer and OTA assets exist
+        run: |
+          test -s packaging/ota/ota-public.pem
+          test -s packaging/ota/grub-ab.cfg
+          test -s packaging/ota/zarya-ota-watchdog.service
+          test -s boot/grub.cfg
+      - name: Check whitespace errors
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ -n "$BASE_REF" ]; then
+            git diff --check "origin/$BASE_REF...HEAD"
+          else
+            git diff-tree --check --root --no-commit-id -r HEAD
+          fi

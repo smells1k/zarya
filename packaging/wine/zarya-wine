@@ -1,0 +1,55 @@
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" = "install" ]; then
+    shift
+    if [ "$(id -u)" -ne 0 ]; then
+        exec sudo -E "$0" install "$@"
+    fi
+    echo '[zarya-wine] Enabling 32-bit packages and installing Wine + framebuffer Xorg backend.'
+    dpkg --add-architecture i386
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        wine wine64 wine32:i386 \
+        xserver-xorg-core xserver-xorg-legacy xserver-xorg-video-fbdev \
+        xserver-xorg-input-libinput xinit x11-xserver-utils dbus-x11
+    install -d -m 0755 /etc/X11/xorg.conf.d
+    cat > /etc/X11/xorg.conf.d/20-zarya-fbdev.conf <<'EOF'
+Section "Device"
+    Identifier "ZaryaFramebuffer"
+    Driver "fbdev"
+    Option "fbdev" "/dev/fb0"
+EndSection
+
+Section "Screen"
+    Identifier "ZaryaScreen"
+    Device "ZaryaFramebuffer"
+    DefaultDepth 24
+    SubSection "Display"
+        Depth 24
+        Modes "1920x1080" "1600x900" "1366x768" "1280x800" "1024x768" "800x600"
+    EndSubSection
+EndSection
+EOF
+    printf 'allowed_users=console\nneeds_root_rights=yes\n' > /etc/X11/Xwrapper.config
+    echo '[zarya-wine] Ready. Double-click a Windows .exe in Files to open it in a separate X11 session.'
+    exit 0
+fi
+
+if [ "${1:-}" = "--help" ] || [ "$#" -ne 1 ]; then
+    echo 'Usage: zarya-wine install | zarya-wine /path/to/program.exe' >&2
+    exit 2
+fi
+EXE=$(realpath -- "$1")
+[ -f "$EXE" ] || { echo "Not a file: $EXE" >&2; exit 1; }
+command -v wine >/dev/null 2>&1 || { echo 'Wine is not installed; run sudo zarya-wine install.' >&2; exit 1; }
+export WINEPREFIX="${WINEPREFIX:-$HOME/.wine}"
+
+resolution=1280x800
+if [ -r /sys/class/graphics/fb0/virtual_size ]; then
+    fb_size=$(cat /sys/class/graphics/fb0/virtual_size)
+    case "$fb_size" in *','*) resolution=$(printf '%s' "$fb_size" | tr ',' x) ;; esac
+fi
+# Use a single Wine virtual desktop so apps have a full-screen work area even
+# though the primary Zarya shell itself draws directly to the framebuffer.
+exec wine explorer "/desktop=Zarya,$resolution" "$EXE"

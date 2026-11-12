@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# Install the running Zarya live system as two root slots plus persistent /home.
+set -Eeuo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: sudo zarya-install /dev/DISK [--yes]
+
+WARNING: the selected disk is repartitioned and all existing data on it is erased.
+The install requires a 32 GiB or larger disk. The layout is:
+  2 MiB BIOS GRUB | 512 MiB EFI | 8 GiB slot A | 8 GiB slot B | remaining /home data
+EOF
+    exit 2
+}
+fail() { echo "[zarya-install] ERROR: $*" >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || exec sudo -E "$0" "$@"
+
+DISK=''
+ASSUME_YES=0
+for arg in "$@"; do
+    case "$arg" in
+        --yes) ASSUME_YES=1 ;;
+        -h|--help) usage ;;
+        *) [ -z "$DISK" ] || usage; DISK=$arg ;;
+    esac
+done
+[ -n "$DISK" ] || usage
+DISK=$(realpath "$DISK")
+[ -b "$DISK" ] || fail "not a block device: $DISK"
+[ "$(lsblk -dnro TYPE "$DISK")" = disk ] || fail 'target must be a whole disk, not a partition'
+
+for cmd in sgdisk partprobe udevadm mkfs.vfat mkfs.ext4 rsync blkid mount umount \
+           grub-install grub-editenv; do
+    command -v "$cmd" >/dev/null || fail "required installation tool is missing: $cmd"
+done
+
+size=$(blockdev --getsize64 "$DISK")
+[ "$size" -ge $((32 * 1024 * 1024 * 1024)) ] || fail 'target disk must be at least 32 GiB'
+
+# Refuse to erase the disk from which this live session itself was booted.
+root_source=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+if [ -b "$root_source" ]; then
+    root_parent=$(lsblk -sno PATH "$root_source" | tail -n 1)
+    [ "$root_parent" != "$DISK" ] || fail 'target appears to contain the currently running root filesystem'
+fi
+while read -r part; do
+    [ -b "$part" ] || continue
+    if findmnt -rn -S "$part" >/dev/null 2>&1; then
+        fail "a partition on the target is mounted: $part"
+    fi
+    if swapon --noheadings --show=NAME 2>/dev/null | grep -Fxq "$part"; then
+        fail "a partition on the target is active swap: $part"
+    fi
+done < <(lsblk -nrpo NAME "$DISK" | tail -n +2)
+
+SRCROOT=/
+[ -r /usr/lib/zarya/shell.py ] || fail 'this does not look like a running Zarya live system'
+[ -r /usr/local/bin/zarya-ota-init ] || fail 'Zarya A/B boot support is missing from this live system'
+GRUB_CFG=/usr/share/zarya/grub-ab.cfg
+[ -r "$GRUB_CFG" ] || fail 'the A/B GRUB configuration is missing from this live system'
+
+cat <<EOF
+Target disk: $DISK
+Size: $((size / 1024 / 1024 / 1024)) GiB
+All data on this disk will be destroyed. The installer creates:
+  BIOS boot, EFI system, ZARYA_A, ZARYA_B, ZARYA_DATA
+EOF
+if [ "$ASSUME_YES" -ne 1 ]; then
+    printf 'Type ERASE %s to continue: ' "$DISK"
+    read -r answer
+    [ "$answer" = "ERASE $DISK" ] || fail 'confirmation did not match'
+fi
+
+TMP=$(mktemp -d /run/zarya-install.XXXXXX)
+MOUNTED=()
+cleanup() {
+    for ((i=${#MOUNTED[@]}-1; i>=0; i--)); do
+        umount "${MOUNTED[$i]}" 2>/dev/null || true
+    done
+    rm -rf "$TMP"
+}
+trap cleanup EXIT INT TERM
+
+# GPT layout: BIOS embedding area, EFI, two 8 GiB system slots, persistent data.
+sgdisk --zap-all "$DISK"
+sgdisk -n 1:2048:+4096 -t 1:ef02 -c 1:ZARYA_BIOS \
+       -n 2:0:+512M -t 2:ef00 -c 2:ZARYA_EFI \
+       -n 3:0:+8G -t 3:8300 -c 3:ZARYA_A \
+       -n 4:0:+8G -t 4:8300 -c 4:ZARYA_B \
+       -n 5:0:0 -t 5:8300 -c 5:ZARYA_DATA "$DISK"
+partprobe "$DISK"
+udevadm settle
+
+part_by_num() {
+    local n=$1 p i
+    for i in $(seq 1 30); do
+        p=$(lsblk -nrpo NAME,PARTN "$DISK" | awk -v n="$n" '$2 == n {print $1; exit}')
+        [ -n "$p" ] && { printf '%s\n' "$p"; return 0; }
+        sleep 1
+        udevadm settle || true
+    done
+    return 1
+}
+P_EFI=$(part_by_num 2) || fail 'EFI partition did not appear'
+P_A=$(part_by_num 3) || fail 'slot A partition did not appear'
+P_B=$(part_by_num 4) || fail 'slot B partition did not appear'
+P_DATA=$(part_by_num 5) || fail 'data partition did not appear'
+
+mkfs.vfat -F 32 -n ZARYA_EFI "$P_EFI"
+mkfs.ext4 -F -m 0 -L ZARYA_A "$P_A"
+mkfs.ext4 -F -m 0 -L ZARYA_B "$P_B"
+mkfs.ext4 -F -m 0 -L ZARYA_DATA "$P_DATA"
+
+A="$TMP/slot-a"; B="$TMP/slot-b"; DATA="$TMP/data"; ESP="$TMP/esp"
+mkdir -p "$A" "$B" "$DATA" "$ESP"
+mount "$P_A" "$A"; MOUNTED+=("$A")
+mount "$P_B" "$B"; MOUNTED+=("$B")
+mount "$P_DATA" "$DATA"; MOUNTED+=("$DATA")
+mount "$P_EFI" "$ESP"; MOUNTED+=("$ESP")
+
+# Copy the merged live root once; the live data and pseudo filesystems are excluded.
+rsync -aHAXSx --numeric-ids \
+    --exclude='/dev/***' --exclude='/proc/***' --exclude='/sys/***' \
+    --exclude='/run/***' --exclude='/tmp/***' --exclude='/var/tmp/***' \
+    --exclude='/var/cache/apt/archives/***' --exclude='/var/lib/apt/lists/***' \
+    --exclude='/home/***' --exclude='/mnt/***' --exclude='/media/***' \
+    --exclude='/cdrom/***' --exclude='/boot/efi/***' \
+    "$SRCROOT" "$A/"
+rsync -aHAXS --numeric-ids "$A/" "$B/"
+rsync -aHAXS --numeric-ids /home/ "$DATA/"
+
+version=$(cat "$A/etc/zarya-version" 2>/dev/null || echo 1.0.1)
+data_uuid=$(blkid -s UUID -o value "$P_DATA")
+efi_uuid=$(blkid -s UUID -o value "$P_EFI")
+slot_a_uuid=$(blkid -s UUID -o value "$P_A")
+slot_b_uuid=$(blkid -s UUID -o value "$P_B")
+machine_id=$(tr -d '-' < /proc/sys/kernel/random/uuid)
+
+prepare_slot() {
+    local root=$1 slot=$2 uuid=$3
+    local kernel initrd kver
+    mkdir -p "$root/home" "$root/boot/efi"
+    kernel=$(find "$root/boot" -maxdepth 1 -name 'vmlinuz-*' -print | sort -V | tail -n 1)
+    [ -n "$kernel" ] || fail "no versioned kernel in slot $slot"
+    kver=${kernel##*/vmlinuz-}
+    initrd="$root/boot/initrd.img-$kver"
+    [ -s "$initrd" ] || fail "missing initramfs for kernel $kver"
+    install -m 0644 "$kernel" "$root/boot/zarya-vmlinuz"
+    install -m 0644 "$initrd" "$root/boot/zarya-initrd.img"
+    cat > "$root/etc/fstab" <<EOF
+UUID=$uuid / ext4 errors=remount-ro 0 1
+UUID=$data_uuid /home ext4 defaults,noatime 0 2
+UUID=$efi_uuid /boot/efi vfat noauto,nofail,umask=0077 0 0
+EOF
+    printf '%s\n' "$slot" > "$root/etc/zarya-slot"
+    printf '%s\n' "$version" > "$root/etc/zarya-version"
+    printf '%s\n' 'smells1k/zarya' > "$root/etc/zarya-ota-repo"
+    printf '%s\n' "$machine_id" > "$root/etc/machine-id"
+    rm -f "$root/var/lib/systemd/random-seed" 2>/dev/null || true
+}
+prepare_slot "$A" A "$slot_a_uuid"
+prepare_slot "$B" B "$slot_b_uuid"
+
+mkdir -p "$ESP/boot/grub"
+grub-install --target=i386-pc --boot-directory="$ESP/boot" --recheck "$DISK"
+grub-install --target=x86_64-efi --efi-directory="$ESP" \
+    --boot-directory="$ESP/boot" --removable --no-nvram --recheck
+install -m 0644 "$GRUB_CFG" "$ESP/boot/grub/grub.cfg"
+grub-editenv "$ESP/boot/grub/grubenv" create
+grub-editenv "$ESP/boot/grub/grubenv" set zarya_default=A zarya_trial= zarya_tries=0
+
+sync
+for ((i=${#MOUNTED[@]}-1; i>=0; i--)); do
+    umount "${MOUNTED[$i]}"
+done
+MOUNTED=()
+echo "[zarya-install] Installed Zarya OS $version to $DISK."
+echo '[zarya-install] User files live on ZARYA_DATA; updates use alternating A/B system slots.'
+echo '[zarya-install] Reboot and remove the USB installer.'

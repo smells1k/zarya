@@ -1,0 +1,40 @@
+#!/bin/sh
+# Login-session supervisor for the live and installed Zarya desktop.
+set -u
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/home/zarya
+mkdir -p /run/zarya
+
+while :; do
+    rm -f /run/zarya/quit
+    /usr/bin/python3 /usr/lib/zarya/shell.py
+    rc=$?
+
+    if [ -s /run/zarya/quit ]; then
+        action=$(cat /run/zarya/quit 2>/dev/null || echo poweroff)
+        rm -f /run/zarya/quit
+        case "$action" in
+            reboot) sudo /sbin/reboot -f ;;
+            *) sudo /sbin/poweroff -f ;;
+        esac
+        sleep 3600
+    fi
+
+    if [ -s /run/zarya/wine-request ]; then
+        exe=$(sed -n '1p' /run/zarya/wine-request 2>/dev/null || true)
+        rm -f /run/zarya/wine-request
+        if [ -n "$exe" ] && [ -f "$exe" ] && \
+                command -v xinit >/dev/null 2>&1 && command -v wine >/dev/null 2>&1; then
+            xinit /usr/local/bin/zarya-wine "$exe" -- :0 vt1 -keeptty -nolisten tcp
+            rc=$?
+        else
+            printf '\nWine is not ready. Install it with: sudo zarya-wine install\n' > /dev/tty1 2>/dev/null || true
+            sleep 4
+        fi
+    fi
+
+    if [ "$rc" -ne 0 ]; then
+        echo "[zarya] desktop exited with status $rc" > /dev/kmsg 2>/dev/null || true
+    fi
+    sleep 1
+done

@@ -1,0 +1,12 @@
+[Unit]
+Description=Zarya OS A/B update boot watchdog
+After=getty@tty1.service
+ConditionPathExists=/etc/zarya-slot
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/zarya-ota-init --watchdog
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,391 @@
+#!/usr/bin/env bash
+# Signed A/B updater for an installed Zarya OS system.
+set -Eeuo pipefail
+
+REPO_FILE=/etc/zarya-ota-repo
+PUBKEY=/etc/zarya-ota-public.pem
+API_ROOT=https://api.github.com/repos
+WORK_DIR=''
+DOWNLOAD_DIR=''
+TARGET_DIR=''
+ESP_DIR=''
+ESP_OWN_MOUNT=0
+TARGET_MOUNTED=0
+
+usage() {
+    cat >&2 <<'EOF'
+Zarya OS updater
+Usage:
+  zarya-update status
+  zarya-update check [VERSION]
+  zarya-update update [VERSION] [--reboot]
+  zarya-update install FILE.zup [--reboot] [--force]
+
+"update" downloads the latest GitHub Release, or a named VERSION. A signed
+bundle is verified before the inactive system slot is changed.
+EOF
+    exit 2
+}
+fail() { echo "[zarya-update] ERROR: $*" >&2; exit 1; }
+info() { echo "[zarya-update] $*"; }
+
+cleanup() {
+    if [ "$TARGET_MOUNTED" -eq 1 ] && [ -n "$TARGET_DIR" ]; then
+        umount "$TARGET_DIR" 2>/dev/null || true
+    fi
+    if [ "$ESP_OWN_MOUNT" -eq 1 ] && [ -n "$ESP_DIR" ]; then
+        umount "$ESP_DIR" 2>/dev/null || true
+    fi
+    [ -z "$ESP_DIR" ] || rmdir "$ESP_DIR" 2>/dev/null || true
+    [ -z "$TARGET_DIR" ] || rmdir "$TARGET_DIR" 2>/dev/null || true
+    [ -z "$WORK_DIR" ] || rm -rf -- "$WORK_DIR"
+    [ -z "$DOWNLOAD_DIR" ] || rm -rf -- "$DOWNLOAD_DIR"
+}
+trap cleanup EXIT INT TERM
+
+[ "$(id -u)" -eq 0 ] || exec sudo -E "$0" "$@"
+mkdir -p /run/lock
+exec 9>/run/lock/zarya-update.lock
+flock -n 9 || fail 'another update process is already running'
+[ "$#" -ge 1 ] || usage
+ACTION=$1
+shift
+
+read_repo() {
+    if [ -n "${ZARYA_OTA_REPO:-}" ]; then
+        printf '%s\n' "$ZARYA_OTA_REPO"
+    elif [ -r "$REPO_FILE" ]; then
+        tr -d ' \t\r\n' < "$REPO_FILE"
+    else
+        printf '%s\n' 'smells1k/zarya'
+    fi
+}
+
+mount_esp() {
+    local dir=$1
+    ESP_DIR=$dir
+    mkdir -p "$dir"
+    if mountpoint -q "$dir"; then
+        ESP_OWN_MOUNT=0
+    else
+        mount -t vfat -L ZARYA_EFI "$dir" || return 1
+        ESP_OWN_MOUNT=1
+    fi
+    GRUBENV="$dir/boot/grub/grubenv"
+    [ -s "$GRUBENV" ] || return 1
+    command -v grub-editenv >/dev/null || return 1
+}
+
+unmount_esp() {
+    if [ "$ESP_OWN_MOUNT" -eq 1 ] && [ -n "$ESP_DIR" ]; then
+        umount "$ESP_DIR" || true
+    fi
+    ESP_OWN_MOUNT=0
+    [ -z "$ESP_DIR" ] || rmdir "$ESP_DIR" 2>/dev/null || true
+    ESP_DIR=''
+}
+
+get_env() {
+    local name=$1 file=$2
+    grub-editenv "$file" list 2>/dev/null | sed -n "s/^${name}=//p" | head -n 1
+}
+
+require_installed() {
+    local slot rootdev root_label data_source data_label
+    slot=$(cat /etc/zarya-slot 2>/dev/null || true)
+    case "$slot" in A|B) ;; *) fail 'OTA requires an installed A/B system; the live ISO cannot be updated in place' ;; esac
+    rootdev=$(findmnt -n -o SOURCE / || true)
+    root_label=$(blkid -s LABEL -o value "$rootdev" 2>/dev/null || true)
+    [ "$root_label" = "ZARYA_$slot" ] || fail "running root is not the expected installed slot (ZARYA_$slot)"
+    data_source=$(findmnt -n -o SOURCE -T /home 2>/dev/null || true)
+    data_label=$(blkid -s LABEL -o value "$data_source" 2>/dev/null || true)
+    [ "$data_label" = ZARYA_DATA ] || fail 'the persistent ZARYA_DATA partition is not mounted at /home'
+    printf '%s\n' "$slot"
+}
+
+check_release() {
+    local requested=${1:-} repo url result version
+    repo=$(read_repo)
+    [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "invalid repository setting: $repo"
+    if [ -n "$requested" ]; then
+        [[ "$requested" =~ ^[0-9][A-Za-z0-9.+~-]*$ ]] || fail "invalid version: $requested"
+        url="$API_ROOT/$repo/releases/tags/v$requested"
+    else
+        url="$API_ROOT/$repo/releases/latest"
+    fi
+    if ! result=$(python3 - "$url" "$requested" <<'PY' 2>&1
+import json, sys, urllib.error, urllib.request
+url, requested = sys.argv[1:]
+req = urllib.request.Request(url, headers={
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "zarya-ota/1",
+    "X-GitHub-Api-Version": "2022-11-28",
+})
+try:
+    with urllib.request.urlopen(req, timeout=30) as response:
+        release = json.load(response)
+except urllib.error.HTTPError as exc:
+    raise SystemExit("GitHub API returned HTTP %s for %s" % (exc.code, url))
+except Exception as exc:
+    raise SystemExit("could not query GitHub Releases: %s" % exc)
+version = release.get("tag_name", "")
+if version.startswith("v"):
+    version = version[1:]
+if not version or (requested and version != requested):
+    raise SystemExit("release tag does not match requested version")
+if release.get("draft") or release.get("prerelease"):
+    raise SystemExit("release is a draft or prerelease")
+asset_name = "zarya-os-%s-amd64.zup" % version
+assets = [a for a in release.get("assets", []) if a.get("name") == asset_name]
+if len(assets) != 1:
+    raise SystemExit("release does not contain exactly one %s asset" % asset_name)
+print(version)
+print(assets[0]["browser_download_url"])
+PY
+); then
+        fail "$result"
+    fi
+    printf '%s\n' "$result"
+}
+
+show_status() {
+    local slot version default trial tries
+    slot=$(cat /etc/zarya-slot 2>/dev/null || true)
+    version=$(cat /etc/zarya-version 2>/dev/null || true)
+    if [ "$slot" != A ] && [ "$slot" != B ]; then
+        echo "Mode: live / not installed"
+        echo "Version: ${version:-unknown}"
+        return 0
+    fi
+    ESP_DIR=$(mktemp -d /run/zarya-ota-status.XXXXXX)
+    if mount_esp "$ESP_DIR"; then
+        default=$(get_env zarya_default "$GRUBENV")
+        trial=$(get_env zarya_trial "$GRUBENV")
+        tries=$(get_env zarya_tries "$GRUBENV")
+        echo "Active slot: $slot"
+        echo "Version: ${version:-unknown}"
+        echo "GRUB default: ${default:-unknown}"
+        echo "Trial slot: ${trial:-none}"
+        echo "Trial boots remaining: ${tries:-0}"
+        unmount_esp
+    else
+        fail 'cannot read the ZARYA_EFI GRUB environment'
+    fi
+}
+
+install_bundle() {
+    local bundle=$1 force=$2 reboot_after=$3
+    local active target_slot target_label rootdev root_label targetdev
+    local data_uuid esp_uuid slot_uuid machine_id current_default current_trial
+    local version arch repository payload_digest payload_bytes rootfs_bytes actual_digest free_bytes
+    local required_bytes local_version bundle_bytes
+    [ -f "$bundle" ] || fail "bundle not found: $bundle"
+    [ -s "$PUBKEY" ] || fail "pinned OTA public key is missing: $PUBKEY"
+    for cmd in openssl zstd tar python3 grub-editenv blkid findmnt; do
+        command -v "$cmd" >/dev/null || fail "$cmd is not installed"
+    done
+
+    active=$(require_installed)
+    if [ "$active" = A ]; then target_slot=B; else target_slot=A; fi
+    target_label="ZARYA_$target_slot"
+    targetdev=$(blkid -L "$target_label" 2>/dev/null || true)
+    [ -b "$targetdev" ] || fail "inactive slot $target_label is missing"
+
+    WORK_DIR=$(mktemp -d /var/tmp/zarya-update.XXXXXX)
+    TARGET_DIR="$WORK_DIR/target"
+    # Validate the uncompressed outer tar in a bounded streaming pass.
+    bundle_bytes=$(stat -c '%s' "$bundle")
+    [ "$bundle_bytes" -le $((6 * 1024 * 1024 * 1024 + 1048576)) ] || fail 'bundle exceeds the supported size limit'
+    python3 - "$bundle" "$WORK_DIR" <<'PY'
+import os, sys, tarfile
+bundle, out = sys.argv[1:]
+limits = {"manifest.json": 65536, "manifest.sig": 16384, "rootfs.tar.zst": 6 * 1024**3}
+seen = set()
+with tarfile.open(bundle, "r:") as archive:
+    for member in archive:
+        if len(seen) >= 3 or member.name not in limits or member.name in seen:
+            raise SystemExit("unexpected or duplicate outer bundle member")
+        seen.add(member.name)
+        if not member.isfile() or member.size <= 0 or member.size > limits[member.name]:
+            raise SystemExit("invalid outer bundle member: " + member.name)
+        if member.name == "rootfs.tar.zst":
+            continue
+        src = archive.extractfile(member)
+        data = src.read(limits[member.name] + 1)
+        if len(data) != member.size:
+            raise SystemExit("truncated outer bundle member")
+        with open(os.path.join(out, member.name), "wb") as dst:
+            dst.write(data)
+if seen != set(limits):
+    raise SystemExit("bundle is missing a required file")
+PY
+    openssl dgst -sha256 -verify "$PUBKEY" -signature "$WORK_DIR/manifest.sig" \
+        "$WORK_DIR/manifest.json" >/dev/null || fail 'update signature is invalid'
+
+    read -r version arch repository payload_digest payload_bytes rootfs_bytes < <(
+        python3 - "$WORK_DIR/manifest.json" <<'PY'
+import json, re, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        m = json.load(f)
+except Exception as exc:
+    raise SystemExit("invalid update manifest: %s" % exc)
+if m.get("format") != 1 or m.get("payload") != "rootfs.tar.zst":
+    raise SystemExit("unsupported update format")
+version = m.get("version", "")
+if not isinstance(version, str) or not re.fullmatch(r"[0-9][A-Za-z0-9.+~-]*", version):
+    raise SystemExit("invalid version in manifest")
+if m.get("architecture") != "amd64" or m.get("repository") != "smells1k/zarya":
+    raise SystemExit("update repository or architecture is not trusted")
+sha = m.get("payload_sha256", "")
+if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+    raise SystemExit("invalid payload hash")
+for key in ("payload_bytes", "rootfs_bytes"):
+    if not isinstance(m.get(key), int) or m[key] <= 0:
+        raise SystemExit("invalid %s" % key)
+if m["rootfs_bytes"] > 7 * 1024**3:
+    raise SystemExit("rootfs exceeds the supported A/B slot size")
+print(version, m["architecture"], m["repository"], sha,
+      m["payload_bytes"], m["rootfs_bytes"])
+PY
+    ) || fail 'invalid update manifest'
+    if [ "$arch" != amd64 ] || [ "$repository" != smells1k/zarya ]; then
+        fail 'update repository or architecture is not trusted'
+    fi
+    [ "$(stat -c '%s' "$bundle")" -gt "$payload_bytes" ] || fail 'bundle is truncated'
+    [ "$(tar -xOf "$bundle" rootfs.tar.zst | wc -c | tr -d ' ')" = "$payload_bytes" ] || fail 'payload size does not match manifest'
+    actual_digest=$(tar -xOf "$bundle" rootfs.tar.zst | sha256sum | awk '{print $1}')
+    [ "$actual_digest" = "$payload_digest" ] || fail 'payload SHA-256 does not match manifest'
+
+    if [ "$force" -ne 1 ] && [ -r /etc/zarya-version ]; then
+        local_version=$(cat /etc/zarya-version)
+        if dpkg --compare-versions "$version" le "$local_version"; then
+            fail "version $version is not newer than installed $local_version (use --force to override)"
+        fi
+    fi
+
+    # Check the rollback state before clearing the inactive slot.
+    ESP_DIR=$(mktemp -d /run/zarya-ota-esp.XXXXXX)
+    mount_esp "$ESP_DIR" || fail 'cannot mount the EFI system partition or read grubenv'
+    current_default=$(get_env zarya_default "$GRUBENV")
+    current_trial=$(get_env zarya_trial "$GRUBENV")
+    [ "$current_default" = "$active" ] || fail "GRUB default ($current_default) does not match active slot ($active)"
+    [ -z "$current_trial" ] || fail "another trial update is still pending (slot $current_trial)"
+    unmount_esp
+
+    mkdir -p "$TARGET_DIR"
+    mount -t ext4 -L "$target_label" "$TARGET_DIR" || fail "cannot mount inactive slot $target_label"
+    TARGET_MOUNTED=1
+    machine_id=''
+    [ -r /etc/machine-id ] && machine_id=$(cat /etc/machine-id)
+    find "$TARGET_DIR" -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf -- {} +
+    free_bytes=$(df -PB1 --output=avail "$TARGET_DIR" | tail -n 1 | tr -d ' ')
+    required_bytes=$((rootfs_bytes + 268435456))
+    [ "$free_bytes" -ge "$required_bytes" ] || fail "inactive slot needs at least ${required_bytes} bytes but has ${free_bytes} free"
+
+    info "Installing signed version $version into inactive slot $target_slot..."
+    tar -xOf "$bundle" rootfs.tar.zst | zstd -q -d -c | \
+        tar --extract --file=- --directory="$TARGET_DIR" --numeric-owner \
+            --same-owner --same-permissions --xattrs --acls --delay-directory-restore \
+            || fail 'could not extract the signed root filesystem'
+
+    mkdir -p "$TARGET_DIR/home" "$TARGET_DIR/boot/efi"
+    data_uuid=$(blkid -s UUID -o value "$(blkid -L ZARYA_DATA 2>/dev/null || true)" 2>/dev/null || true)
+    esp_uuid=$(blkid -s UUID -o value "$(blkid -L ZARYA_EFI 2>/dev/null || true)" 2>/dev/null || true)
+    slot_uuid=$(blkid -s UUID -o value "$targetdev")
+    if [ -z "$data_uuid" ] || [ -z "$esp_uuid" ] || [ -z "$slot_uuid" ]; then
+        fail 'installed partition UUIDs are incomplete'
+    fi
+    cat > "$TARGET_DIR/etc/fstab" <<EOF
+UUID=$slot_uuid / ext4 errors=remount-ro 0 1
+UUID=$data_uuid /home ext4 defaults,noatime 0 2
+UUID=$esp_uuid /boot/efi vfat noauto,nofail,umask=0077 0 0
+EOF
+    printf '%s\n' "$target_slot" > "$TARGET_DIR/etc/zarya-slot"
+    printf '%s\n' "$version" > "$TARGET_DIR/etc/zarya-version"
+    printf '%s\n' "$(read_repo)" > "$TARGET_DIR/etc/zarya-ota-repo"
+    [ -z "$machine_id" ] || printf '%s\n' "$machine_id" > "$TARGET_DIR/etc/machine-id"
+    [ -s "$TARGET_DIR/boot/zarya-vmlinuz" ] || fail 'signed rootfs has no boot/zarya-vmlinuz'
+    [ -s "$TARGET_DIR/boot/zarya-initrd.img" ] || fail 'signed rootfs has no boot/zarya-initrd.img'
+    sync
+    umount "$TARGET_DIR"
+    TARGET_MOUNTED=0
+
+    # Re-check GRUB state and atomically arm the bounded trial boot.
+    ESP_DIR=$(mktemp -d /run/zarya-ota-esp.XXXXXX)
+    mount_esp "$ESP_DIR" || fail 'cannot remount the EFI system partition'
+    current_default=$(get_env zarya_default "$GRUBENV")
+    current_trial=$(get_env zarya_trial "$GRUBENV")
+    if [ "$current_default" != "$active" ] || [ -n "$current_trial" ]; then
+        fail 'GRUB rollback state changed during update'
+    fi
+    grub-editenv "$GRUBENV" set "zarya_default=$active" "zarya_trial=$target_slot" zarya_tries=3
+    sync
+    unmount_esp
+    info "Update staged in slot $target_slot. The current slot remains the rollback target."
+    info 'Reboot to try it; the new slot is confirmed only after the desktop initializes.'
+    if [ "$reboot_after" -eq 1 ]; then /sbin/reboot; fi
+}
+
+case "$ACTION" in
+    status)
+        [ "$#" -eq 0 ] || usage
+        show_status
+        ;;
+    check)
+        [ "$#" -le 1 ] || usage
+        meta=$(check_release "${1:-}")
+        version=$(printf '%s\n' "$meta" | sed -n '1p')
+        url=$(printf '%s\n' "$meta" | sed -n '2p')
+        current=$(cat /etc/zarya-version 2>/dev/null || true)
+        echo "Installed version: ${current:-unknown}"
+        echo "Available version: $version"
+        echo "Bundle: $url"
+        ;;
+    update)
+        requested=''
+        reboot_after=0
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --reboot) reboot_after=1 ;;
+                *) [ -z "$requested" ] || usage; requested=$1 ;;
+            esac
+            shift
+        done
+        [ -z "$requested" ] || [[ "$requested" =~ ^[0-9][A-Za-z0-9.+~-]*$ ]] || usage
+        require_installed >/dev/null
+        meta=$(check_release "$requested")
+        version=$(printf '%s\n' "$meta" | sed -n '1p')
+        url=$(printf '%s\n' "$meta" | sed -n '2p')
+        current=$(cat /etc/zarya-version 2>/dev/null || true)
+        if [ -n "$current" ] && dpkg --compare-versions "$version" le "$current"; then
+            info "Already up to date (installed $current, latest $version)."
+            exit 0
+        fi
+        mkdir -p /home/zarya/.cache
+        DOWNLOAD_DIR=$(mktemp -d /home/zarya/.cache/zarya-ota.XXXXXX)
+        bundle="$DOWNLOAD_DIR/zarya-os-${version}-amd64.zup"
+        info "Downloading Zarya OS $version..."
+        curl --fail --location --retry 3 --retry-delay 2 \
+            --header 'Accept: application/octet-stream' \
+            --header 'User-Agent: zarya-ota/1' "$url" -o "$bundle"
+        install_bundle "$bundle" 0 "$reboot_after"
+        ;;
+    install)
+        [ "$#" -ge 1 ] || usage
+        bundle=$1
+        shift
+        reboot_after=0
+        force=0
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --reboot) reboot_after=1 ;;
+                --force) force=1 ;;
+                *) usage ;;
+            esac
+            shift
+        done
+        install_bundle "$bundle" "$force" "$reboot_after"
+        ;;
+    *) usage ;;
+esac

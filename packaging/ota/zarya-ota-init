@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# GRUB A/B confirmation and boot watchdog helpers.
+set -Eeuo pipefail
+
+fail() { echo "[zarya-ota-init] ERROR: $*" >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || exec sudo -n "$0" "$@"
+[ "$#" -eq 1 ] || { echo 'Usage: zarya-ota-init --mark-good | --status | --watchdog' >&2; exit 2; }
+ACTION=$1
+SLOT=$(cat /etc/zarya-slot 2>/dev/null || true)
+case "$SLOT" in A|B) ;; *) [ "$ACTION" = --status ] && { echo 'Not an installed A/B system.'; exit 0; }; exit 0 ;; esac
+
+command -v grub-editenv >/dev/null || fail 'grub-editenv is not installed'
+ESP_DIR=$(mktemp -d /run/zarya-ota-init.XXXXXX)
+ESP_MOUNTED=0
+cleanup() {
+    if [ "$ESP_MOUNTED" -eq 1 ]; then umount "$ESP_DIR" 2>/dev/null || true; fi
+    rmdir "$ESP_DIR" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+mount_esp() {
+    mount -t vfat -L ZARYA_EFI "$ESP_DIR" || fail 'cannot mount the EFI system partition'
+    ESP_MOUNTED=1
+    ENVFILE="$ESP_DIR/boot/grub/grubenv"
+    [ -s "$ENVFILE" ] || fail 'GRUB environment file is missing'
+}
+get_env() {
+    grub-editenv "$ENVFILE" list 2>/dev/null | sed -n "s/^$1=//p" | head -n 1
+}
+
+mount_esp
+default=$(get_env zarya_default)
+trial=$(get_env zarya_trial)
+tries=$(get_env zarya_tries)
+
+case "$ACTION" in
+    --status)
+        printf 'Active slot: %s\nVersion: %s\nGRUB default: %s\nTrial slot: %s\nTrial boots remaining: %s\n' \
+            "$SLOT" "$(cat /etc/zarya-version 2>/dev/null || echo unknown)" \
+            "${default:-unknown}" "${trial:-none}" "${tries:-0}"
+        ;;
+    --mark-good)
+        if [ "$trial" = "$SLOT" ]; then
+            grub-editenv "$ENVFILE" set "zarya_default=$SLOT" zarya_trial= zarya_tries=0
+            sync
+            logger -t zarya-ota "confirmed slot $SLOT as good"
+            echo "[zarya-ota-init] Slot $SLOT confirmed; rollback point advanced."
+        fi
+        ;;
+    --watchdog)
+        # Only trial boots need a timer. Leave the EFI filesystem unmounted
+        # while waiting so the desktop can safely update grubenv.
+        if [ "$trial" != "$SLOT" ] || [ "$default" = "$SLOT" ]; then
+            exit 0
+        fi
+        umount "$ESP_DIR"
+        ESP_MOUNTED=0
+        rmdir "$ESP_DIR"
+        ESP_DIR=$(mktemp -d /run/zarya-ota-watchdog.XXXXXX)
+        sleep "${ZARYA_OTA_WATCHDOG_SECONDS:-180}"
+        mount_esp
+        default=$(get_env zarya_default)
+        trial=$(get_env zarya_trial)
+        if [ "$trial" = "$SLOT" ] && [ "$default" != "$SLOT" ]; then
+            logger -t zarya-ota "slot $SLOT did not confirm within watchdog interval; rebooting for rollback"
+            sync
+            /sbin/reboot -f
+        fi
+        ;;
+    *)
+        echo 'Usage: zarya-ota-init --mark-good | --status | --watchdog' >&2
+        exit 2
+        ;;
+esac

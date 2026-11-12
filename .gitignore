@@ -1,0 +1,20 @@
+# Generated package/ISO outputs; keep large images out of the source workspace.
+/dist/
+/release/
+*.iso
+*.iso.sha256
+*.zup
+*.zup.sha256
+*.deb
+
+# Python caches and local build trees.
+__pycache__/
+*.py[cod]
+/.build/
+/build/
+/rootfs/
+
+# Private OTA signing material must never enter version control.
+packaging/ota/ota-private.pem
+packaging/ota/ota-signing-private.pem
+/packaging/ota/*private*.pem
