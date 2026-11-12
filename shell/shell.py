@@ -981,6 +981,7 @@ class Zarya:
                 if new_size:
                     self.W, self.H = new_size
                     self.canvas = Canvas(self.W, self.H)
+                    self.input.resize(self.W, self.H)
                     self._wall_arr = None
                     self.theme.scale = max(0.78, min(1.6, self.W / 1280.0))
                     self.dirty = True

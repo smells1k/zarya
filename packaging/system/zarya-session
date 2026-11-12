@@ -3,16 +3,25 @@
 set -u
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/home/zarya
-mkdir -p /run/zarya
+RUN_DIR=/run/zarya
+LOG_DIR=$RUN_DIR/log
+SESSION_LOG=$LOG_DIR/session.log
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+reset_tty() {
+    stty sane < /dev/tty >/dev/null 2>&1 || true
+}
 
 while :; do
-    rm -f /run/zarya/quit
-    /usr/bin/python3 /usr/lib/zarya/shell.py
+    rm -f "$RUN_DIR/quit"
+    reset_tty
+    /usr/bin/python3 /usr/lib/zarya/shell.py >>"$SESSION_LOG" 2>&1
     rc=$?
+    reset_tty
 
-    if [ -s /run/zarya/quit ]; then
-        action=$(cat /run/zarya/quit 2>/dev/null || echo poweroff)
-        rm -f /run/zarya/quit
+    if [ -s "$RUN_DIR/quit" ]; then
+        action=$(cat "$RUN_DIR/quit" 2>/dev/null || echo poweroff)
+        rm -f "$RUN_DIR/quit"
         case "$action" in
             reboot) sudo /sbin/reboot -f ;;
             *) sudo /sbin/poweroff -f ;;
@@ -20,13 +29,14 @@ while :; do
         sleep 3600
     fi
 
-    if [ -s /run/zarya/wine-request ]; then
-        exe=$(sed -n '1p' /run/zarya/wine-request 2>/dev/null || true)
-        rm -f /run/zarya/wine-request
+    if [ -s "$RUN_DIR/wine-request" ]; then
+        exe=$(sed -n '1p' "$RUN_DIR/wine-request" 2>/dev/null || true)
+        rm -f "$RUN_DIR/wine-request"
         if [ -n "$exe" ] && [ -f "$exe" ] && \
                 command -v xinit >/dev/null 2>&1 && command -v wine >/dev/null 2>&1; then
             xinit /usr/local/bin/zarya-wine "$exe" -- :0 vt1 -keeptty -nolisten tcp
             rc=$?
+            reset_tty
         else
             printf '\nWine is not ready. Install it with: sudo zarya-wine install\n' > /dev/tty1 2>/dev/null || true
             sleep 4
@@ -34,7 +44,10 @@ while :; do
     fi
 
     if [ "$rc" -ne 0 ]; then
-        echo "[zarya] desktop exited with status $rc" > /dev/kmsg 2>/dev/null || true
+        printf '[%s] desktop exited with status %s\n' \
+            "$(date +%T 2>/dev/null || echo unknown)" "$rc" >>"$SESSION_LOG" 2>/dev/null || true
+        sleep 2
+    else
+        sleep 1
     fi
-    sleep 1
 done

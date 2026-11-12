@@ -8,7 +8,7 @@
 
 Откройте [страницу Releases](https://github.com/smells1k/zarya/releases) и скачайте `zarya-os-<версия>-amd64.iso` и соответствующий `.sha256`. ISO не хранится в git и не должен собираться в каталоге исходников: сборочный rootfs и промежуточные файлы помещаются в системный временный каталог, а GitHub Release публикует ISO и OTA-пакет отдельными файлами.
 
-В GitHub Actions release workflow запускается для тега вида `v1.0.1`. Он собирает гибридный BIOS/UEFI ISO и checksums, затем публикует их с `GITHUB_TOKEN` и разрешением `contents: write`. Подписанный OTA-пакет добавляется в тот же Release, если настроен ключ подписи; без ключа Release всё равно содержит ISO, но OTA-asset будет пропущен.
+В GitHub Actions release workflow запускается для тега вида `v1.0.2`. Он собирает гибридный BIOS/UEFI ISO и checksums, затем публикует их с `GITHUB_TOKEN` и разрешением `contents: write`. Подписанный OTA-пакет добавляется в тот же Release, если настроен ключ подписи; без ключа Release всё равно содержит ISO, но OTA-asset будет пропущен.
 
 Для OTA владелец репозитория должен один раз добавить GitHub Actions secret `ZARYA_OTA_SIGNING_KEY` — содержимое соответствующего приватного PEM-ключа. Публичный ключ, встроенный в систему, находится в `packaging/ota/ota-public.pem`. Приватный ключ не входит в репозиторий; не коммитьте его и не публикуйте в логе workflow. Workflow намеренно не создаёт неподписанное OTA-обновление.
 
@@ -68,12 +68,12 @@ Wine включён в сборку. Двойной щелчок по `.exe` в 
 sudo apt-get update
 sudo apt-get install debootstrap squashfs-tools xorriso grub-pc-bin \
   grub-efi-amd64-bin grub-common mtools dosfstools cpio ca-certificates zstd
-sudo env ZARYA_VERSION=1.0.1 \
+sudo env ZARYA_VERSION=1.0.2 \
   ZARYA_WORKDIR=/var/tmp/zarya-build \
-  ZARYA_OUT=/var/tmp/zarya-os-1.0.1-amd64.iso \
+  ZARYA_OUT=/var/tmp/zarya-os-1.0.2-amd64.iso \
   bash packaging/build-iso.sh
 ```
 
 Зависимости самого образа (включая ядро, Wine и инструменты установки) конвейер устанавливает внутри временного Debian rootfs. Локальная сборка ресурсоёмкая; не задавайте workspace каталог как `ZARYA_WORKDIR` и не складывайте ISO в git-дерево.
 
-Проверки синтаксиса скриптов и компиляции Python выполняются workflow `Validate source`. В этой копии проекта на данный момент нет подтверждённого полного запуска сборки, проверки ISO в BIOS/UEFI или теста OTA на реальном установленном диске.
+Проверки синтаксиса скриптов, компиляции Python и обработки событий ввода выполняются workflow `Validate source`. Проверка `v1.0.1` в VMware выявила проблему с клавиатурой/мышью; исправление выпускается как `v1.0.2`. Успешная CI-сборка сама по себе не подтверждает запуск на целевой машине, установку на диск или применение OTA.

@@ -34,7 +34,9 @@ jobs:
             packaging/ota/zarya-ota-init packaging/install/zarya-install \
             packaging/system/zarya-session packaging/wine/zarya-wine
       - name: Compile Python sources
-        run: python3 -m py_compile shell/*.py dev/snap_desktop.py
+        run: python3 -m py_compile shell/*.py dev/snap_desktop.py tests/*.py
+      - name: Test input event handling
+        run: python3 -m unittest discover -s tests -v
       - name: Check GRUB configuration syntax
         run: |
           grub-script-check boot/grub.cfg

@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${ZARYA_VERSION:-1.0.1}"
+VERSION="${ZARYA_VERSION:-1.0.2}"
 WORK="${ZARYA_WORKDIR:-${RUNNER_TEMP:-/var/tmp}/zarya-build}"
 WORK="$(realpath -m "$WORK")"
 ROOT="$WORK/rootfs"
@@ -104,9 +104,10 @@ chroot "$ROOT" /bin/bash -euc '
 '
 
 mkdir -p "$ROOT/usr/lib/zarya" "$ROOT/usr/local/bin" "$ROOT/usr/share/zarya" \
+    "$ROOT/usr/lib/tmpfiles.d" "$ROOT/etc/modules-load.d" \
     "$ROOT/etc/systemd/system/getty@tty1.service.d" \
     "$ROOT/etc/X11/xorg.conf.d" "$ROOT/etc/modprobe.d" \
-    "$ROOT/etc/live" "$ROOT/run/zarya"
+    "$ROOT/etc/live"
 cp -a "$SRC/shell/"*.py "$ROOT/usr/lib/zarya/"
 if [ -d "$SRC/shell/fonts" ]; then
     mkdir -p "$ROOT/usr/lib/zarya/fonts"
@@ -156,7 +157,23 @@ ExecStart=
 ExecStart=-/sbin/agetty --autologin zarya --noclear %I $TERM
 EOF
 chroot "$ROOT" systemctl enable getty@tty1.service
-install -m 0644 "$SRC/packaging/ota/zarya-ota-watchdog.service" \
+
+# Make evdev nodes available for the custom framebuffer input loop in VMs and
+# on physical machines; systemd loads these drivers before the autologin VT.
+cat > "$ROOT/etc/modules-load.d/zarya-input.conf" <<'EOF'
+evdev
+psmouse
+usbhid
+hid_generic
+EOF
+
+# /run is a tmpfs, so create writable per-session state at every boot.
+cat > "$ROOT/usr/lib/tmpfiles.d/zarya.conf" <<'EOF'
+d /run/zarya 0755 zarya zarya -
+d /run/zarya/log 0755 zarya zarya -
+EOF
+
+install -m 0644 "$SRC/packaging/ota/zarya-ota-watchdog.service"   \
     "$ROOT/etc/systemd/system/zarya-ota-watchdog.service"
 chroot "$ROOT" systemctl enable zarya-ota-watchdog.service
 
@@ -195,8 +212,6 @@ printf 'Zarya OS %s\n' "$VERSION" > "$ISODIR/.disk-info"
 # Keep the live root compact; the installed system stores /home separately.
 rm -rf "$ROOT/var/lib/apt/lists"/* "$ROOT/var/cache/apt/archives"/*
 rm -rf "$ROOT/tmp"/* "$ROOT/var/tmp"/* "$ROOT/run"/*
-mkdir -p "$ROOT/run/zarya"
-chown 1000:1000 "$ROOT/run/zarya" 2>/dev/null || true
 
 echo '==> create compressed live root filesystem'
 mksquashfs "$ROOT" "$ISODIR/live/filesystem.squashfs" \

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${1:-${ZARYA_VERSION:-1.0.1}}"
+VERSION="${1:-${ZARYA_VERSION:-1.0.2}}"
 OUTDIR="${2:-$SRC/dist}"
 STAGE="${TMPDIR:-/var/tmp}/zarya-deb-${VERSION}-$$"
 PKG="$STAGE/zarya-shell"
