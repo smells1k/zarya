@@ -94,4 +94,5 @@ jobs:
           name: Zarya OS ${{ steps.meta.outputs.version }}
           body: ${{ steps.package.outputs.note }}
           fail_on_unmatched_files: true
+          overwrite_files: true
           files: release/*

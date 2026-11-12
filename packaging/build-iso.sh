@@ -77,7 +77,7 @@ EOF
 
 # Wine's 32-bit dependencies are needed for legacy Windows applications.
 chroot "$ROOT" dpkg --add-architecture i386
-PKGS="systemd-sysv live-boot live-config network-manager sudo curl openssl \
+PKGS="systemd-sysv live-boot network-manager sudo curl openssl \
 python3 python3-numpy python3-pil fonts-dejavu-core iproute2 util-linux \
 e2fsprogs dosfstools gdisk parted rsync grub-common grub-pc-bin \
 grub-efi-amd64-bin mtools ca-certificates less nano xz-utils zstd \
@@ -172,6 +172,8 @@ EOF
 
 cat > "$ROOT/etc/live/boot.conf" <<'EOF'
 LIVE_HOSTNAME=zarya
+LIVE_USERNAME=zarya
+LIVE_USER_FULLNAME="Zarya OS user"
 EOF
 
 KVER="$(basename "$(find "$ROOT/boot" -maxdepth 1 -name 'vmlinuz-*' -print | sort -V | tail -1)" | sed 's/^vmlinuz-//')"
@@ -187,6 +189,7 @@ cp "$ROOT/boot/initrd.img-$KVER" "$ROOT/boot/zarya-initrd.img"
 cp "$ROOT/boot/vmlinuz-$KVER" "$ISODIR/live/vmlinuz"
 cp "$ROOT/boot/initrd.img-$KVER" "$ISODIR/live/initrd.img"
 cp "$SRC/boot/grub.cfg" "$ISODIR/boot/grub/grub.cfg"
+install -m 0644 /usr/share/grub/unicode.pf2 "$ISODIR/boot/grub/unicode.pf2"
 printf 'Zarya OS %s\n' "$VERSION" > "$ISODIR/.disk-info"
 
 # Keep the live root compact; the installed system stores /home separately.

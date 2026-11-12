@@ -162,9 +162,11 @@ prepare_slot "$A" A "$slot_a_uuid"
 prepare_slot "$B" B "$slot_b_uuid"
 
 mkdir -p "$ESP/boot/grub"
+[ -s /usr/share/grub/unicode.pf2 ] || fail 'the GRUB Unicode font is missing from this live system'
 grub-install --target=i386-pc --boot-directory="$ESP/boot" --recheck "$DISK"
 grub-install --target=x86_64-efi --efi-directory="$ESP" \
     --boot-directory="$ESP/boot" --removable --no-nvram --recheck
+install -m 0644 /usr/share/grub/unicode.pf2 "$ESP/boot/grub/unicode.pf2"
 install -m 0644 "$GRUB_CFG" "$ESP/boot/grub/grub.cfg"
 grub-editenv "$ESP/boot/grub/grubenv" create
 grub-editenv "$ESP/boot/grub/grubenv" set zarya_default=A zarya_trial= zarya_tries=0
