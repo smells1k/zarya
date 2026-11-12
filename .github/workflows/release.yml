@@ -54,7 +54,7 @@ jobs:
           mkdir -p release
           sudo env \
             ZARYA_VERSION="$VERSION" \
-            ZARYA_WORKDIR="$RUNNER_TEMP/zarya-build" \
+            ZARYA_WORKDIR="/var/tmp/zarya-build" \
             ZARYA_OUT="$GITHUB_WORKSPACE/release/zarya-os-$VERSION-amd64.iso" \
             bash packaging/build-iso.sh
 
@@ -75,7 +75,7 @@ jobs:
             umask 077
             printf '%s\n' "$ZARYA_OTA_SIGNING_KEY" > "$key"
             sudo bash packaging/ota/build-update.sh \
-              "$RUNNER_TEMP/zarya-build/rootfs" "$VERSION" "$key" "$GITHUB_WORKSPACE/release"
+              "/var/tmp/zarya-build/rootfs" "$VERSION" "$key" "$GITHUB_WORKSPACE/release"
             echo 'ota_enabled=true' >> "$GITHUB_OUTPUT"
             echo 'note=Signed A/B OTA bundle included. Verify downloaded files with SHA256SUMS.' >> "$GITHUB_OUTPUT"
           fi
