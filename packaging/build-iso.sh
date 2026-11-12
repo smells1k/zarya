@@ -85,7 +85,7 @@ linux-image-amd64 initramfs-tools wine wine64 wine32:i386 fonts-wine \
 xserver-xorg-core xserver-xorg-legacy xserver-xorg-video-fbdev \
 xserver-xorg-input-libinput xinit x11-xserver-utils dbus-x11"
 echo '==> install kernel, desktop dependencies, Wine, and installer/OTA tools'
-chroot "$ROOT" /bin/bash -euc "apt-get update; apt-get install -y --no-install-recommends $PKGS"
+chroot "$ROOT" /bin/bash -euc "export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y --no-install-recommends $PKGS"
 
 # Users and login
 # shellcheck disable=SC2016
