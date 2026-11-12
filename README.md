@@ -8,7 +8,7 @@
 
 Откройте [страницу Releases](https://github.com/smells1k/zarya/releases) и скачайте `zarya-os-<версия>-amd64.iso` и соответствующий `.sha256`. ISO не хранится в git и не должен собираться в каталоге исходников: сборочный rootfs и промежуточные файлы помещаются в системный временный каталог, а GitHub Release публикует ISO и OTA-пакет отдельными файлами.
 
-В GitHub Actions release workflow запускается для тега вида `v1.0.2`. Он собирает гибридный BIOS/UEFI ISO и checksums, затем публикует их с `GITHUB_TOKEN` и разрешением `contents: write`. Подписанный OTA-пакет добавляется в тот же Release, если настроен ключ подписи; без ключа Release всё равно содержит ISO, но OTA-asset будет пропущен.
+В GitHub Actions release workflow запускается для тега вида `v1.0.3`. Он собирает гибридный BIOS/UEFI ISO и checksums, затем публикует их с `GITHUB_TOKEN` и разрешением `contents: write`. Подписанный OTA-пакет добавляется в тот же Release, если настроен ключ подписи; без ключа Release всё равно содержит ISO, но OTA-asset будет пропущен.
 
 Для OTA владелец репозитория должен один раз добавить GitHub Actions secret `ZARYA_OTA_SIGNING_KEY` — содержимое соответствующего приватного PEM-ключа. Публичный ключ, встроенный в систему, находится в `packaging/ota/ota-public.pem`. Приватный ключ не входит в репозиторий; не коммитьте его и не публикуйте в логе workflow. Workflow намеренно не создаёт неподписанное OTA-обновление.
 
@@ -43,13 +43,13 @@ zarya-update status
 zarya-update check
 sudo zarya-update update
 # или скачать указанную версию и сразу перезагрузиться:
-sudo zarya-update update 1.0.2 --reboot
+sudo zarya-update update 1.0.3 --reboot
 ```
 
 Обновление скачивается из GitHub Release, проверяются подпись manifest и SHA-256 корневого образа, после чего неактивный слот полностью перезаписывается. Данные `/home` остаются отдельно. GRUB делает до трёх пробных запусков; система помечает слот успешным после инициализации framebuffer-оболочки. Если система не дошла до оболочки, watchdog инициирует перезапуск, а GRUB возвращается к предыдущему слоту. Для ручной установки проверенного `.zup`-файла:
 
 ```bash
-sudo zarya-update install /путь/к/zarya-os-1.0.2-amd64.zup
+sudo zarya-update install /путь/к/zarya-os-1.0.3-amd64.zup
 ```
 
 Обновления должны быть выпущены тем же ключом, публичная часть которого уже встроена в установленную систему. Ротация ключа требует отдельного доверенного механизма и сейчас автоматически не выполняется.
@@ -68,12 +68,12 @@ Wine включён в сборку. Двойной щелчок по `.exe` в 
 sudo apt-get update
 sudo apt-get install debootstrap squashfs-tools xorriso grub-pc-bin \
   grub-efi-amd64-bin grub-common mtools dosfstools cpio ca-certificates zstd
-sudo env ZARYA_VERSION=1.0.2 \
+sudo env ZARYA_VERSION=1.0.3 \
   ZARYA_WORKDIR=/var/tmp/zarya-build \
-  ZARYA_OUT=/var/tmp/zarya-os-1.0.2-amd64.iso \
+  ZARYA_OUT=/var/tmp/zarya-os-1.0.3-amd64.iso \
   bash packaging/build-iso.sh
 ```
 
 Зависимости самого образа (включая ядро, Wine и инструменты установки) конвейер устанавливает внутри временного Debian rootfs. Локальная сборка ресурсоёмкая; не задавайте workspace каталог как `ZARYA_WORKDIR` и не складывайте ISO в git-дерево.
 
-Проверки синтаксиса скриптов, компиляции Python и обработки событий ввода выполняются workflow `Validate source`. Проверка `v1.0.1` в VMware выявила проблему с клавиатурой/мышью; исправление выпускается как `v1.0.2`. Успешная CI-сборка сама по себе не подтверждает запуск на целевой машине, установку на диск или применение OTA.
+Проверки синтаксиса скриптов, компиляции Python и обработки событий ввода выполняются workflow `Validate source`. Проверка live-образа в VMware выявила, что минимальная сборка не включала полный udev-стек; `v1.0.3` добавляет udev, загрузку USB/input-драйверов и видимый статус обнаруженных устройств. Успешная CI-сборка сама по себе не подтверждает запуск на целевой машине, установку на диск или применение OTA.

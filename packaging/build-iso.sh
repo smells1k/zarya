@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${ZARYA_VERSION:-1.0.2}"
+VERSION="${ZARYA_VERSION:-1.0.3}"
 WORK="${ZARYA_WORKDIR:-${RUNNER_TEMP:-/var/tmp}/zarya-build}"
 WORK="$(realpath -m "$WORK")"
 ROOT="$WORK/rootfs"
@@ -77,7 +77,7 @@ EOF
 
 # Wine's 32-bit dependencies are needed for legacy Windows applications.
 chroot "$ROOT" dpkg --add-architecture i386
-PKGS="systemd-sysv live-boot network-manager sudo curl openssl \
+PKGS="systemd-sysv udev live-boot network-manager sudo curl openssl \
 python3 python3-numpy python3-pil fonts-dejavu-core iproute2 util-linux \
 e2fsprogs dosfstools gdisk parted rsync grub-common grub-pc-bin \
 grub-efi-amd64-bin mtools ca-certificates less nano xz-utils zstd \
@@ -105,7 +105,7 @@ chroot "$ROOT" /bin/bash -euc '
 
 mkdir -p "$ROOT/usr/lib/zarya" "$ROOT/usr/local/bin" "$ROOT/usr/share/zarya" \
     "$ROOT/usr/lib/tmpfiles.d" "$ROOT/etc/modules-load.d" \
-    "$ROOT/etc/systemd/system/getty@tty1.service.d" \
+    "$ROOT/etc/udev/rules.d" "$ROOT/etc/systemd/system/getty@tty1.service.d" \
     "$ROOT/etc/X11/xorg.conf.d" "$ROOT/etc/modprobe.d" \
     "$ROOT/etc/live"
 cp -a "$SRC/shell/"*.py "$ROOT/usr/lib/zarya/"
@@ -163,8 +163,20 @@ chroot "$ROOT" systemctl enable getty@tty1.service
 cat > "$ROOT/etc/modules-load.d/zarya-input.conf" <<'EOF'
 evdev
 psmouse
+atkbd
+i8042
 usbhid
 hid_generic
+hid_multitouch
+xhci_hcd
+xhci_pci
+ehci_pci
+EOF
+
+# Keep keyboard and pointer event nodes readable by the live user as a fallback
+# when the shell cannot acquire its root framebuffer/input session.
+cat > "$ROOT/etc/udev/rules.d/71-zarya-input.rules" <<'EOF'
+SUBSYSTEM=="input", GROUP="input", MODE="0660"
 EOF
 
 # /run is a tmpfs, so create writable per-session state at every boot.

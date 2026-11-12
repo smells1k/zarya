@@ -35,6 +35,7 @@ class InputManagerTests(unittest.TestCase):
     def test_relative_mouse_and_click_events_are_kept(self):
         self.manager._mouse_event({}, EV_REL, REL_X, 10)
         self.assertEqual(self.manager.mouse, (60, 25))
+        self.assertEqual(self.manager.mouse_moves, 1)
         self.manager._mouse_event({}, EV_KEY, BTN_LEFT, 1)
         self.assertEqual(self.events[-1]["type"], "down")
         self.assertEqual(self.events[-1]["btn"], "left")
@@ -44,6 +45,12 @@ class InputManagerTests(unittest.TestCase):
         self.manager._parse_tty()
         self.assertEqual([(e["code"], e["ch"]) for e in self.events],
                          [(0, "a"), (28, "\n"), (103, "\x1b[A")])
+        self.assertEqual(self.manager.key_events, 3)
+
+    def test_status_makes_missing_input_visible(self):
+        status = self.manager.status()
+        self.assertIn("мышь нет/0", status)
+        self.assertIn("кл. нет/0", status)
 
 
 if __name__ == "__main__":

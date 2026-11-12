@@ -129,7 +129,7 @@ rsync -aHAXSx --numeric-ids \
 rsync -aHAXS --numeric-ids "$A/" "$B/"
 rsync -aHAXS --numeric-ids /home/ "$DATA/"
 
-version=$(cat "$A/etc/zarya-version" 2>/dev/null || echo 1.0.2)
+version=$(cat "$A/etc/zarya-version" 2>/dev/null || echo 1.0.3)
 data_uuid=$(blkid -s UUID -o value "$P_DATA")
 efi_uuid=$(blkid -s UUID -o value "$P_EFI")
 slot_a_uuid=$(blkid -s UUID -o value "$P_A")

@@ -916,6 +916,8 @@ class Zarya:
                theme.TEXT_DIM, anchor="cc")
         c.text(x + cw // 2, y + int(190 * s), "Заря OS · %s" % VERSION, self.t.fs(12),
                theme.TEXT_MUTE, anchor="cc")
+        c.text(x + cw // 2, y + int(218 * s), self.input.status(), self.t.fs(9),
+               theme.TEXT_MUTE, anchor="cc")
         # button
         bw2, bh2 = int(cw * 0.62), int(46 * s)
         bx = x + (cw - bw2) // 2

@@ -7,6 +7,9 @@ RUN_DIR=/run/zarya
 LOG_DIR=$RUN_DIR/log
 SESSION_LOG=$LOG_DIR/session.log
 mkdir -p "$LOG_DIR" 2>/dev/null || true
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm settle --timeout=10 >/dev/null 2>&1 || true
+fi
 
 reset_tty() {
     stty sane < /dev/tty >/dev/null 2>&1 || true

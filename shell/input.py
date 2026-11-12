@@ -163,6 +163,8 @@ class InputManager:
         self._tty_pending = bytearray()
         self._tty_escape_at = 0.0
         self._closed = False
+        self.key_events = 0
+        self.mouse_moves = 0
         self._fake = bool(os.environ.get("ZARYA_FAKE"))
         if self._fake:
             return
@@ -174,6 +176,18 @@ class InputManager:
     def resize(self, width, height):
         self.w, self.h = max(1, width), max(1, height)
         self._move_to(*self.mouse)
+
+    def status(self):
+        keyboards = sum(1 for d in self.fds.values() if d["kind"] == "kbd")
+        mice = [d for d in self.fds.values() if d["kind"] == "mouse"]
+        key_source = "evdev" if keyboards else ("VT" if self._tty_fd is not None else "нет")
+        if mice:
+            modes = sorted({"ABS" if d.get("abs_pair") else "REL" for d in mice})
+            mouse_source = "+".join(modes)
+        else:
+            mouse_source = "нет"
+        return "Ввод: кл. %s/%d · мышь %s/%d" % (
+            key_source, self.key_events, mouse_source, self.mouse_moves)
 
     def _scan_devices(self):
         self._last_scan = time.monotonic()
@@ -301,6 +315,7 @@ class InputManager:
         if (x, y) == self.mouse:
             return
         self.mouse = (x, y)
+        self.mouse_moves += 1
         self.on_event({"type": "move", "x": x, "y": y})
 
     @staticmethod
@@ -352,6 +367,7 @@ class InputManager:
             return
         if value == 2:
             return  # ignore kernel repeat; widgets can implement their own
+        self.key_events += 1
         mods = {"shift": self.shift, "ctrl": self.ctrl, "alt": self.alt}
         ch = self.keymap.char(code, self.shift)
         if code == 58:  # Caps Lock toggles US/Russian layout.
@@ -379,6 +395,7 @@ class InputManager:
         self._parse_tty()
 
     def _tty_key(self, code, ch):
+        self.key_events += 1
         self.on_event({"type": "key", "code": code, "ch": ch,
                        "mods": {"shift": False, "ctrl": False, "alt": False}})
 
