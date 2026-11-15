@@ -37,6 +37,7 @@ class KubuntuPackagingContractTests(unittest.TestCase):
         self.assertIn("ln -s ../run/systemd/resolve/stub-resolv.conf", self.build)
 
     def test_release_splits_iso_under_asset_limit_and_publishes_reassembly_checksums(self):
+        self.assertIn('sudo chown "$USER":"$USER" "$iso" "$iso.sha256"', self.release)
         self.assertIn("split --bytes=1900M --numeric-suffixes=0", self.release)
         self.assertIn('cat "${parts[@]}" | cmp - "$iso"', self.release)
         self.assertIn("JOIN_ISO.txt", self.release)

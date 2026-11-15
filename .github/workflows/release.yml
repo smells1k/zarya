@@ -80,6 +80,7 @@ jobs:
           set -euo pipefail
           iso="release/zarya-os-$VERSION-amd64.iso"
           base="zarya-os-$VERSION-amd64.iso"
+          sudo chown "$USER":"$USER" "$iso" "$iso.sha256"
           (cd release && sha256sum "$base" > "$base.sha256")
           split --bytes=1900M --numeric-suffixes=0 --suffix-length=2 \
             "$iso" "$iso.part"
