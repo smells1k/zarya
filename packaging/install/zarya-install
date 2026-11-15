@@ -2,18 +2,23 @@
 # Install the running Zarya live system as two root slots plus persistent /home.
 set -Eeuo pipefail
 
+fail() { echo "[zarya-install] ERROR: $*" >&2; exit 1; }
 usage() {
-    cat >&2 <<'EOF'
+    cat >&2 <<EOF
 Usage: sudo zarya-install /dev/DISK [--yes]
 
 WARNING: the selected disk is repartitioned and all existing data on it is erased.
-The install requires a 32 GiB or larger disk. The layout is:
-  2 MiB BIOS GRUB | 512 MiB EFI | 8 GiB slot A | 8 GiB slot B | remaining /home data
+The install requires a ${ZARYA_MIN_DISK_GIB:-64} GiB or larger disk. The layout is:
+  2 MiB BIOS GRUB | 512 MiB EFI | ${ZARYA_AB_SLOT_GIB:-20} GiB slot A | ${ZARYA_AB_SLOT_GIB:-20} GiB slot B | remaining /home data
 EOF
     exit 2
 }
-fail() { echo "[zarya-install] ERROR: $*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || exec sudo -E "$0" "$@"
+
+LIMITS_FILE=/usr/lib/zarya/ota-limits.sh
+[ -r "$LIMITS_FILE" ] || fail "A/B capacity configuration is missing: $LIMITS_FILE"
+# shellcheck disable=SC1090
+. "$LIMITS_FILE"
 
 DISK=''
 ASSUME_YES=0
@@ -35,7 +40,8 @@ for cmd in sgdisk partprobe udevadm mkfs.vfat mkfs.ext4 rsync blkid mount umount
 done
 
 size=$(blockdev --getsize64 "$DISK")
-[ "$size" -ge $((32 * 1024 * 1024 * 1024)) ] || fail 'target disk must be at least 32 GiB'
+[ "$size" -ge $((ZARYA_MIN_DISK_GIB * 1024 * 1024 * 1024)) ] || \
+    fail "target disk must be at least ${ZARYA_MIN_DISK_GIB} GiB"
 
 # Refuse to erase the disk from which this live session itself was booted.
 root_source=$(findmnt -n -o SOURCE / 2>/dev/null || true)
@@ -54,8 +60,16 @@ while read -r part; do
 done < <(lsblk -nrpo NAME "$DISK" | tail -n +2)
 
 SRCROOT=/
-[ -r /usr/lib/zarya/shell.py ] || fail 'this does not look like a running Zarya live system'
+[ -r /etc/os-release ] || fail 'the live system has no os-release identity'
+# shellcheck disable=SC1091
+. /etc/os-release
+if [ "${ID:-}" != ubuntu ] || [ "${VERSION_CODENAME:-}" != resolute ]; then
+    fail 'this installer only supports the Kubuntu 26.04 (Resolute) Zarya live system'
+fi
+[ -s /usr/share/wayland-sessions/plasma.desktop ] || \
+    fail 'the standard KDE Plasma Wayland session is missing from this live system'
 [ -r /usr/local/bin/zarya-ota-init ] || fail 'Zarya A/B boot support is missing from this live system'
+[ -r /usr/lib/zarya/ota-limits.sh ] || fail 'Zarya A/B capacity configuration is missing from this live system'
 GRUB_CFG=/usr/share/zarya/grub-ab.cfg
 [ -r "$GRUB_CFG" ] || fail 'the A/B GRUB configuration is missing from this live system'
 
@@ -81,12 +95,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# GPT layout: BIOS embedding area, EFI, two 8 GiB system slots, persistent data.
+# GPT layout: BIOS embedding area, EFI, two 20 GiB Kubuntu system slots, persistent data.
 sgdisk --zap-all "$DISK"
 sgdisk -n 1:2048:+4096 -t 1:ef02 -c 1:ZARYA_BIOS \
        -n 2:0:+512M -t 2:ef00 -c 2:ZARYA_EFI \
-       -n 3:0:+8G -t 3:8300 -c 3:ZARYA_A \
-       -n 4:0:+8G -t 4:8300 -c 4:ZARYA_B \
+       -n "3:0:+${ZARYA_AB_SLOT_GIB}G" -t 3:8300 -c 3:ZARYA_A \
+       -n "4:0:+${ZARYA_AB_SLOT_GIB}G" -t 4:8300 -c 4:ZARYA_B \
        -n 5:0:0 -t 5:8300 -c 5:ZARYA_DATA "$DISK"
 partprobe "$DISK"
 udevadm settle
@@ -129,7 +143,7 @@ rsync -aHAXSx --numeric-ids \
 rsync -aHAXS --numeric-ids "$A/" "$B/"
 rsync -aHAXS --numeric-ids /home/ "$DATA/"
 
-version=$(cat "$A/etc/zarya-version" 2>/dev/null || echo 1.0.3)
+version=$(cat "$A/etc/zarya-version" 2>/dev/null || echo 2.0.0)
 data_uuid=$(blkid -s UUID -o value "$P_DATA")
 efi_uuid=$(blkid -s UUID -o value "$P_EFI")
 slot_a_uuid=$(blkid -s UUID -o value "$P_A")
@@ -176,6 +190,6 @@ for ((i=${#MOUNTED[@]}-1; i>=0; i--)); do
     umount "${MOUNTED[$i]}"
 done
 MOUNTED=()
-echo "[zarya-install] Installed Zarya OS $version to $DISK."
-echo '[zarya-install] User files live on ZARYA_DATA; updates use alternating A/B system slots.'
+echo "[zarya-install] Installed Zarya OS $version (Kubuntu 26.04 LTS with KDE Plasma) to $DISK."
+echo '[zarya-install] User files live on ZARYA_DATA; signed updates use alternating 20 GiB A/B system slots.'
 echo '[zarya-install] Reboot and remove the USB installer.'

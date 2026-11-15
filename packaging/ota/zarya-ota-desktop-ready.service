@@ -1,0 +1,13 @@
+[Unit]
+Description=Confirm a Zarya A/B update after KDE Plasma starts
+After=display-manager.service
+Wants=display-manager.service
+ConditionPathExists=/etc/zarya-slot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/zarya-ota-init --confirm-desktop
+TimeoutStartSec=165s
+
+[Install]
+WantedBy=graphical.target

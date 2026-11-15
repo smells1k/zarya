@@ -11,12 +11,24 @@ ROOTFS="$(realpath "$1")"
 VERSION="$2"
 PRIVATE_KEY="$(realpath "$3")"
 OUTDIR="$(realpath -m "$4")"
-PUBKEY="$(cd "$(dirname "$0")" && pwd)/ota-public.pem"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=packaging/ota/limits.sh
+. "$SCRIPT_DIR/limits.sh"
+PUBKEY="$SCRIPT_DIR/ota-public.pem"
 
 [ -d "$ROOTFS" ] || { echo "Missing rootfs: $ROOTFS" >&2; exit 1; }
 [ -s "$PRIVATE_KEY" ] || { echo "Missing OTA signing key: $PRIVATE_KEY" >&2; exit 1; }
 [ -s "$PUBKEY" ] || { echo "Missing OTA public key: $PUBKEY" >&2; exit 1; }
 [[ "$VERSION" =~ ^[0-9][A-Za-z0-9.+~-]*$ ]] || { echo "Invalid version: $VERSION" >&2; exit 1; }
+[ -r "$ROOTFS/etc/os-release" ] || { echo 'Rootfs has no /etc/os-release' >&2; exit 1; }
+grep -qx 'ID=ubuntu' "$ROOTFS/etc/os-release" || {
+    echo 'Only an Ubuntu/Kubuntu rootfs can be packaged for this A/B updater.' >&2
+    exit 1
+}
+grep -qx 'VERSION_CODENAME=resolute' "$ROOTFS/etc/os-release" || {
+    echo 'Only the Ubuntu 26.04 Resolute rootfs is supported by this OTA format.' >&2
+    exit 1
+}
 for cmd in tar zstd openssl sha256sum python3; do
     command -v "$cmd" >/dev/null || { echo "Missing build tool: $cmd" >&2; exit 1; }
 done
@@ -48,8 +60,8 @@ trap cleanup EXIT INT TERM
 
 ROOTFS_SHA256=$(sha256sum "$STAGE/rootfs.tar.zst" | awk '{print $1}')
 ROOTFS_COMPRESSED_BYTES=$(stat -c '%s' "$STAGE/rootfs.tar.zst")
-[ "$ROOTFS_COMPRESSED_BYTES" -le $((6 * 1024 * 1024 * 1024)) ] || {
-    echo 'Compressed OTA payload exceeds the supported bundle limit.' >&2
+[ "$ROOTFS_COMPRESSED_BYTES" -le $((ZARYA_MAX_OTA_PAYLOAD_GIB * 1024 * 1024 * 1024)) ] || {
+    echo "Compressed OTA payload exceeds the ${ZARYA_MAX_OTA_PAYLOAD_GIB} GiB bundle limit." >&2
     exit 1
 }
 ROOTFS_BYTES=$(du -sb --one-file-system \
@@ -57,21 +69,25 @@ ROOTFS_BYTES=$(du -sb --one-file-system \
     --exclude="$ROOTFS/proc/*" --exclude="$ROOTFS/sys/*" \
     --exclude="$ROOTFS/run/*" --exclude="$ROOTFS/tmp/*" \
     --exclude="$ROOTFS/var/tmp/*" "$ROOTFS" | awk '{print $1}')
-[ "$ROOTFS_BYTES" -le $((7 * 1024 * 1024 * 1024)) ] || {
-    echo 'The rootfs is too large for the fixed 8 GiB A/B slots.' >&2
+[ "$ROOTFS_BYTES" -le $((ZARYA_MAX_ROOTFS_GIB * 1024 * 1024 * 1024)) ] || {
+    echo "Rootfs exceeds the ${ZARYA_MAX_ROOTFS_GIB} GiB A/B payload limit." >&2
     exit 1
 }
 
-python3 - "$VERSION" "$ROOTFS_SHA256" "$ROOTFS_COMPRESSED_BYTES" "$ROOTFS_BYTES" \
+python3 - "$VERSION" "$ZARYA_OTA_FORMAT" "$ZARYA_OTA_BASE" \
+    "$ROOTFS_SHA256" "$ROOTFS_COMPRESSED_BYTES" "$ROOTFS_BYTES" \
     > "$STAGE/manifest.json" <<'PY'
 import json, re, sys
-version, digest, compressed, uncompressed = sys.argv[1:]
+version, format_id, base, digest, compressed, uncompressed = sys.argv[1:]
 if not re.fullmatch(r"[0-9][A-Za-z0-9.+~-]*", version):
     raise SystemExit("invalid version")
+if not re.fullmatch(r"[0-9]+", format_id) or base != "ubuntu-resolute":
+    raise SystemExit("invalid base or OTA format")
 if not re.fullmatch(r"[0-9a-f]{64}", digest):
     raise SystemExit("invalid sha256")
 manifest = {
-    "format": 1,
+    "format": int(format_id),
+    "base": base,
     "version": version,
     "architecture": "amd64",
     "repository": "smells1k/zarya",

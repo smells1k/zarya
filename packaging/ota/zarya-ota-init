@@ -1,13 +1,24 @@
 #!/usr/bin/env bash
-# GRUB A/B confirmation and boot watchdog helpers.
+# GRUB A/B confirmation and boot watchdog helpers for Kubuntu Plasma.
 set -Eeuo pipefail
 
 fail() { echo "[zarya-ota-init] ERROR: $*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || exec sudo -n "$0" "$@"
-[ "$#" -eq 1 ] || { echo 'Usage: zarya-ota-init --mark-good | --status | --watchdog' >&2; exit 2; }
+[ "$#" -eq 1 ] || {
+    echo 'Usage: zarya-ota-init --mark-good | --status | --watchdog | --confirm-desktop' >&2
+    exit 2
+}
 ACTION=$1
 SLOT=$(cat /etc/zarya-slot 2>/dev/null || true)
-case "$SLOT" in A|B) ;; *) [ "$ACTION" = --status ] && { echo 'Not an installed A/B system.'; exit 0; }; exit 0 ;; esac
+case "$SLOT" in
+    A|B) ;;
+    *)
+        if [ "$ACTION" = --status ]; then
+            echo 'Not an installed A/B system.'
+        fi
+        exit 0
+        ;;
+esac
 
 command -v grub-editenv >/dev/null || fail 'grub-editenv is not installed'
 ESP_DIR=$(mktemp -d /run/zarya-ota-init.XXXXXX)
@@ -17,6 +28,7 @@ cleanup() {
     rmdir "$ESP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
+
 mount_esp() {
     mount -t vfat -L ZARYA_EFI "$ESP_DIR" || fail 'cannot mount the EFI system partition'
     ESP_MOUNTED=1
@@ -25,6 +37,14 @@ mount_esp() {
 }
 get_env() {
     grub-editenv "$ENVFILE" list 2>/dev/null | sed -n "s/^$1=//p" | head -n 1
+}
+mark_good() {
+    if [ "$trial" = "$SLOT" ]; then
+        grub-editenv "$ENVFILE" set "zarya_default=$SLOT" zarya_trial= zarya_tries=0
+        sync
+        logger -t zarya-ota "confirmed slot $SLOT as good"
+        echo "[zarya-ota-init] Slot $SLOT confirmed after KDE Plasma initialized; rollback point advanced."
+    fi
 }
 
 mount_esp
@@ -39,16 +59,41 @@ case "$ACTION" in
             "${default:-unknown}" "${trial:-none}" "${tries:-0}"
         ;;
     --mark-good)
-        if [ "$trial" = "$SLOT" ]; then
-            grub-editenv "$ENVFILE" set "zarya_default=$SLOT" zarya_trial= zarya_tries=0
-            sync
-            logger -t zarya-ota "confirmed slot $SLOT as good"
-            echo "[zarya-ota-init] Slot $SLOT confirmed; rollback point advanced."
+        mark_good
+        ;;
+    --confirm-desktop)
+        # Stable boots do not need a confirmation. The service only waits during
+        # an OTA trial, and confirms only after both KWin and Plasma are running.
+        if [ "$trial" != "$SLOT" ] || [ "$default" = "$SLOT" ]; then
+            exit 0
         fi
+        if ! command -v pgrep >/dev/null 2>&1; then
+            fail 'pgrep is required to verify the KDE Plasma session'
+        fi
+        uid=$(id -u zarya 2>/dev/null) || fail 'the zarya desktop account is missing'
+        timeout=${ZARYA_OTA_DESKTOP_TIMEOUT:-150}
+        [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=150
+        umount "$ESP_DIR"
+        ESP_MOUNTED=0
+        for ((elapsed=0; elapsed<timeout; elapsed+=2)); do
+            if [ -S "/run/user/$uid/bus" ] && \
+                    pgrep -u "$uid" -x kwin_wayland >/dev/null 2>&1 && \
+                    pgrep -u "$uid" -x plasmashell >/dev/null 2>&1; then
+                mount_esp
+                default=$(get_env zarya_default)
+                trial=$(get_env zarya_trial)
+                if [ "$trial" = "$SLOT" ] && [ "$default" != "$SLOT" ]; then
+                    mark_good
+                fi
+                exit 0
+            fi
+            sleep 2
+        done
+        fail "KDE Plasma did not become ready within ${timeout}s; the boot watchdog will roll back"
         ;;
     --watchdog)
-        # Only trial boots need a timer. Leave the EFI filesystem unmounted
-        # while waiting so the desktop can safely update grubenv.
+        # Only trial boots need a timer. Leave EFI unmounted while waiting so
+        # the desktop confirmation service can safely update grubenv.
         if [ "$trial" != "$SLOT" ] || [ "$default" = "$SLOT" ]; then
             exit 0
         fi
@@ -67,7 +112,7 @@ case "$ACTION" in
         fi
         ;;
     *)
-        echo 'Usage: zarya-ota-init --mark-good | --status | --watchdog' >&2
+        echo 'Usage: zarya-ota-init --mark-good | --status | --watchdog | --confirm-desktop' >&2
         exit 2
         ;;
 esac

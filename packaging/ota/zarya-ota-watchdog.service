@@ -1,6 +1,6 @@
 [Unit]
 Description=Zarya OS A/B update boot watchdog
-After=getty@tty1.service
+After=display-manager.service
 ConditionPathExists=/etc/zarya-slot
 
 [Service]

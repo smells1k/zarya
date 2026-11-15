@@ -22,8 +22,10 @@ RCTRL = 97
 ALT = 56
 RALT = 100
 
-# Linux input_event is 24 bytes on the amd64 live image.
-_EVENT_SIZE = 24
+# amd64 input_event = timeval (two 64-bit longs), type, code, value.
+# In struct's standard '<' mode, use q (not l: standard l is only 32-bit).
+_EVENT_STRUCT = struct.Struct("<qqHHi")
+_EVENT_SIZE = _EVENT_STRUCT.size
 _KEY_BITS_SIZE = 96
 
 
@@ -290,7 +292,7 @@ class InputManager:
                 self._drop_fd(fd)
                 continue
             for off in range(0, len(data) - (_EVENT_SIZE - 1), _EVENT_SIZE):
-                _sec, _usec, typ, code, value = struct.unpack_from("<llHHi", data, off)
+                _sec, _usec, typ, code, value = _EVENT_STRUCT.unpack_from(data, off)
                 if info["kind"] == "mouse":
                     self._mouse_event(info, typ, code, value)
                 else:

@@ -1,11 +1,12 @@
 import os
 import sys
+import time
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shell"))
 from input import (ABS_X, ABS_Y, BTN_LEFT, EV_ABS, EV_KEY, EV_REL, REL_X,
-                   InputManager)
+                   _EVENT_SIZE, _EVENT_STRUCT, InputManager)
 
 
 class InputManagerTests(unittest.TestCase):
@@ -16,6 +17,36 @@ class InputManagerTests(unittest.TestCase):
         self.events = []
         self.manager = InputManager(self.events.append, 100, 50)
         self.addCleanup(self.manager.close)
+
+    def test_amd64_input_event_uses_linux_64_bit_timeval_layout(self):
+        self.assertEqual(_EVENT_SIZE, 24)
+        # The seconds and microseconds are 64-bit fields in Linux's native
+        # struct input_event on this amd64-only image; standard-size longs are
+        # 32-bit and silently shift every mouse event field.
+        data = _EVENT_STRUCT.pack(1_700_000_000, 123_456, EV_REL, REL_X, 7)
+        sec, usec, event_type, code, value = _EVENT_STRUCT.unpack(data)
+        self.assertEqual((sec, usec, event_type, code, value),
+                         (1_700_000_000, 123_456, EV_REL, REL_X, 7))
+
+    def test_poll_decodes_amd64_evdev_mouse_events(self):
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, write_fd)
+        self.manager.fds[read_fd] = {"kind": "mouse"}
+        self.manager._last_scan = time.monotonic()
+        stream = b"".join((
+            _EVENT_STRUCT.pack(1_700_000_000, 123_456, EV_REL, REL_X, 10),
+            _EVENT_STRUCT.pack(1_700_000_000, 123_457, EV_KEY, BTN_LEFT, 1),
+        ))
+        os.write(write_fd, stream)
+
+        with patch("input.select.select", return_value=([read_fd], [], [])):
+            self.manager.poll(timeout=0)
+
+        self.assertEqual(self.manager.mouse, (60, 25))
+        self.assertEqual(self.events, [
+            {"type": "move", "x": 60, "y": 25},
+            {"type": "down", "btn": "left", "x": 60, "y": 25},
+        ])
 
     def test_absolute_tablet_position_is_scaled_to_framebuffer(self):
         device = {

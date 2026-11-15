@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release version without the leading v (for example 1.0.3)
+        description: Release version without the leading v (for example 2.0.0)
         required: true
         type: string
 
@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   build-and-release:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 180
     steps:
       - name: Check out source
@@ -39,14 +39,29 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
+      - name: Make room for the full Kubuntu image
+        run: |
+          set -euo pipefail
+          sudo apt-get clean
+          sudo rm -rf \
+            /usr/local/lib/android/sdk \
+            /usr/local/share/chromium \
+            /usr/local/share/powershell \
+            /usr/share/dotnet \
+            /usr/share/swift \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - name: Install ISO build tools
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            debootstrap squashfs-tools xorriso grub-pc-bin grub-efi-amd64-bin \
-            grub-common mtools dosfstools cpio kmod ca-certificates zstd openssl
+            debootstrap ubuntu-keyring squashfs-tools xorriso grub-pc-bin \
+            grub-efi-amd64-bin grub-common mtools dosfstools cpio kmod \
+            ca-certificates zstd openssl
 
-      - name: Build live ISO
+      - name: Build live Kubuntu ISO
         env:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
@@ -58,6 +73,32 @@ jobs:
             ZARYA_OUT="$GITHUB_WORKSPACE/release/zarya-os-$VERSION-amd64.iso" \
             bash packaging/build-iso.sh
 
+      - name: Split ISO into GitHub-compatible release assets
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          iso="release/zarya-os-$VERSION-amd64.iso"
+          base="zarya-os-$VERSION-amd64.iso"
+          (cd release && sha256sum "$base" > "$base.sha256")
+          split --bytes=1900M --numeric-suffixes=0 --suffix-length=2 \
+            "$iso" "$iso.part"
+          shopt -s nullglob
+          parts=("$iso.part"*)
+          [ "${#parts[@]}" -ge 1 ]
+          cat "${parts[@]}" | cmp - "$iso"
+          cat > release/JOIN_ISO.txt <<EOF
+          The ISO is split into numbered parts to fit the GitHub per-file asset limit.
+          Download every $base.partNN file into one directory, then join them in numeric order.
+
+          Linux or macOS:
+            cat $base.part* > $base
+            sha256sum -c $base.sha256
+
+          Verify the downloaded parts and this note with SHA256SUMS before joining.
+          EOF
+          rm -- "$iso"
+
       - name: Build signed OTA bundle when signing key is configured
         id: package
         env:
@@ -67,7 +108,7 @@ jobs:
           set -euo pipefail
           if [ -z "$ZARYA_OTA_SIGNING_KEY" ]; then
             echo 'ota_enabled=false' >> "$GITHUB_OUTPUT"
-            echo 'note=ISO published; signed OTA bundle omitted because repository secret ZARYA_OTA_SIGNING_KEY is not configured.' >> "$GITHUB_OUTPUT"
+            echo 'note=ISO parts published; reassemble them using JOIN_ISO.txt. Signed OTA bundle omitted because repository secret ZARYA_OTA_SIGNING_KEY is not configured.' >> "$GITHUB_OUTPUT"
             echo '::warning::Set the repository Actions secret ZARYA_OTA_SIGNING_KEY and rerun this workflow to publish OTA updates.'
           else
             key="$RUNNER_TEMP/zarya-ota-signing.pem"
@@ -77,10 +118,12 @@ jobs:
             sudo bash packaging/ota/build-update.sh \
               "/var/tmp/zarya-build/rootfs" "$VERSION" "$key" "$GITHUB_WORKSPACE/release"
             echo 'ota_enabled=true' >> "$GITHUB_OUTPUT"
-            echo 'note=Signed A/B OTA bundle included. Verify downloaded files with SHA256SUMS.' >> "$GITHUB_OUTPUT"
+            echo 'note=ISO parts and signed A/B OTA bundle included. Reassemble the ISO using JOIN_ISO.txt; verify assets with SHA256SUMS.' >> "$GITHUB_OUTPUT"
           fi
+          sudo rm -rf /var/tmp/zarya-build/rootfs /var/tmp/zarya-build/iso
           sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE/release"
-          (cd release && sha256sum "zarya-os-$VERSION-amd64.iso" > SHA256SUMS)
+          (cd release && sha256sum "zarya-os-$VERSION-amd64.iso.part"* \
+            "zarya-os-$VERSION-amd64.iso.sha256" JOIN_ISO.txt > SHA256SUMS)
           if [ -f "release/zarya-os-$VERSION-amd64.zup" ]; then
             (cd release && sha256sum "zarya-os-$VERSION-amd64.zup" >> SHA256SUMS)
           fi

@@ -29,6 +29,18 @@ EOF
 fail() { echo "[zarya-update] ERROR: $*" >&2; exit 1; }
 info() { echo "[zarya-update] $*"; }
 
+LIMITS_FILE=/usr/lib/zarya/ota-limits.sh
+if [ -r "$LIMITS_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$LIMITS_FILE"
+elif [ -r "$(dirname "$0")/limits.sh" ]; then
+    # Source-tree fallback for validation and development.
+    # shellcheck disable=SC1091
+    . "$(dirname "$0")/limits.sh"
+else
+    fail "A/B capacity configuration is missing: $LIMITS_FILE"
+fi
+
 cleanup() {
     if [ "$TARGET_MOUNTED" -eq 1 ] && [ -n "$TARGET_DIR" ]; then
         umount "$TARGET_DIR" 2>/dev/null || true
@@ -92,6 +104,12 @@ get_env() {
 
 require_installed() {
     local slot rootdev root_label data_source data_label
+    [ -r /etc/os-release ] || fail 'the installed operating system identity is missing'
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    if [ "${ID:-}" != ubuntu ] || [ "${VERSION_CODENAME:-}" != resolute ]; then
+        fail 'OTA requires a freshly installed Kubuntu 26.04 (Resolute) A/B system; old Debian/8 GiB installations must be reinstalled'
+    fi
     slot=$(cat /etc/zarya-slot 2>/dev/null || true)
     case "$slot" in A|B) ;; *) fail 'OTA requires an installed A/B system; the live ISO cannot be updated in place' ;; esac
     rootdev=$(findmnt -n -o SOURCE / || true)
@@ -139,8 +157,12 @@ asset_name = "zarya-os-%s-amd64.zup" % version
 assets = [a for a in release.get("assets", []) if a.get("name") == asset_name]
 if len(assets) != 1:
     raise SystemExit("release does not contain exactly one %s asset" % asset_name)
+asset_size = assets[0].get("size")
+if not isinstance(asset_size, int) or asset_size <= 0:
+    raise SystemExit("release asset has an invalid size")
 print(version)
 print(assets[0]["browser_download_url"])
+print(asset_size)
 PY
 ); then
         fail "$result"
@@ -177,7 +199,7 @@ install_bundle() {
     local bundle=$1 force=$2 reboot_after=$3
     local active target_slot target_label rootdev root_label targetdev
     local data_uuid esp_uuid slot_uuid machine_id current_default current_trial
-    local version arch repository payload_digest payload_bytes rootfs_bytes actual_digest free_bytes
+    local version base arch repository payload_digest payload_bytes rootfs_bytes actual_digest free_bytes
     local required_bytes local_version bundle_bytes
     [ -f "$bundle" ] || fail "bundle not found: $bundle"
     [ -s "$PUBKEY" ] || fail "pinned OTA public key is missing: $PUBKEY"
@@ -195,11 +217,13 @@ install_bundle() {
     TARGET_DIR="$WORK_DIR/target"
     # Validate the uncompressed outer tar in a bounded streaming pass.
     bundle_bytes=$(stat -c '%s' "$bundle")
-    [ "$bundle_bytes" -le $((6 * 1024 * 1024 * 1024 + 1048576)) ] || fail 'bundle exceeds the supported size limit'
-    python3 - "$bundle" "$WORK_DIR" <<'PY'
+    [ "$bundle_bytes" -le $((ZARYA_MAX_OTA_PAYLOAD_GIB * 1024 * 1024 * 1024 + 1048576)) ] || \
+        fail "bundle exceeds the ${ZARYA_MAX_OTA_PAYLOAD_GIB} GiB supported size limit"
+    python3 - "$bundle" "$WORK_DIR" "$ZARYA_MAX_OTA_PAYLOAD_GIB" <<'PY'
 import os, sys, tarfile
-bundle, out = sys.argv[1:]
-limits = {"manifest.json": 65536, "manifest.sig": 16384, "rootfs.tar.zst": 6 * 1024**3}
+bundle, out, max_payload_gib = sys.argv[1:]
+limits = {"manifest.json": 65536, "manifest.sig": 16384,
+          "rootfs.tar.zst": int(max_payload_gib) * 1024**3}
 seen = set()
 with tarfile.open(bundle, "r:") as archive:
     for member in archive:
@@ -222,16 +246,21 @@ PY
     openssl dgst -sha256 -verify "$PUBKEY" -signature "$WORK_DIR/manifest.sig" \
         "$WORK_DIR/manifest.json" >/dev/null || fail 'update signature is invalid'
 
-    read -r version arch repository payload_digest payload_bytes rootfs_bytes < <(
-        python3 - "$WORK_DIR/manifest.json" <<'PY'
+    read -r version base arch repository payload_digest payload_bytes rootfs_bytes < <(
+        python3 - "$WORK_DIR/manifest.json" "$ZARYA_OTA_FORMAT" \
+            "$ZARYA_OTA_BASE" "$ZARYA_MAX_OTA_PAYLOAD_GIB" \
+            "$ZARYA_MAX_ROOTFS_GIB" <<'PY'
 import json, re, sys
+path, expected_format, expected_base, max_payload_gib, max_rootfs_gib = sys.argv[1:]
 try:
-    with open(sys.argv[1], encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         m = json.load(f)
 except Exception as exc:
     raise SystemExit("invalid update manifest: %s" % exc)
-if m.get("format") != 1 or m.get("payload") != "rootfs.tar.zst":
-    raise SystemExit("unsupported update format")
+if (m.get("format") != int(expected_format)
+        or m.get("base") != expected_base
+        or m.get("payload") != "rootfs.tar.zst"):
+    raise SystemExit("unsupported update format or operating-system base")
 version = m.get("version", "")
 if not isinstance(version, str) or not re.fullmatch(r"[0-9][A-Za-z0-9.+~-]*", version):
     raise SystemExit("invalid version in manifest")
@@ -241,16 +270,19 @@ sha = m.get("payload_sha256", "")
 if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
     raise SystemExit("invalid payload hash")
 for key in ("payload_bytes", "rootfs_bytes"):
-    if not isinstance(m.get(key), int) or m[key] <= 0:
+    if type(m.get(key)) is not int or m[key] <= 0:
         raise SystemExit("invalid %s" % key)
-if m["rootfs_bytes"] > 7 * 1024**3:
+if m["payload_bytes"] > int(max_payload_gib) * 1024**3:
+    raise SystemExit("compressed payload exceeds the supported limit")
+if m["rootfs_bytes"] > int(max_rootfs_gib) * 1024**3:
     raise SystemExit("rootfs exceeds the supported A/B slot size")
-print(version, m["architecture"], m["repository"], sha,
+print(version, m["base"], m["architecture"], m["repository"], sha,
       m["payload_bytes"], m["rootfs_bytes"])
 PY
     ) || fail 'invalid update manifest'
-    if [ "$arch" != amd64 ] || [ "$repository" != smells1k/zarya ]; then
-        fail 'update repository or architecture is not trusted'
+    if [ "$base" != "$ZARYA_OTA_BASE" ] || [ "$arch" != amd64 ] || \
+            [ "$repository" != smells1k/zarya ]; then
+        fail 'update operating-system base, repository, or architecture is not trusted'
     fi
     [ "$(stat -c '%s' "$bundle")" -gt "$payload_bytes" ] || fail 'bundle is truncated'
     [ "$(tar -xOf "$bundle" rootfs.tar.zst | wc -c | tr -d ' ')" = "$payload_bytes" ] || fail 'payload size does not match manifest'
@@ -337,9 +369,11 @@ case "$ACTION" in
         meta=$(check_release "${1:-}")
         version=$(printf '%s\n' "$meta" | sed -n '1p')
         url=$(printf '%s\n' "$meta" | sed -n '2p')
+        bundle_bytes=$(printf '%s\n' "$meta" | sed -n '3p')
         current=$(cat /etc/zarya-version 2>/dev/null || true)
         echo "Installed version: ${current:-unknown}"
         echo "Available version: $version"
+        echo "Bundle size: $((bundle_bytes / 1024 / 1024)) MiB"
         echo "Bundle: $url"
         ;;
     update)
@@ -357,18 +391,25 @@ case "$ACTION" in
         meta=$(check_release "$requested")
         version=$(printf '%s\n' "$meta" | sed -n '1p')
         url=$(printf '%s\n' "$meta" | sed -n '2p')
+        bundle_bytes_expected=$(printf '%s\n' "$meta" | sed -n '3p')
         current=$(cat /etc/zarya-version 2>/dev/null || true)
         if [ -n "$current" ] && dpkg --compare-versions "$version" le "$current"; then
             info "Already up to date (installed $current, latest $version)."
             exit 0
         fi
         mkdir -p /home/zarya/.cache
+        download_free=$(df -PB1 --output=avail /home/zarya/.cache | tail -n 1 | tr -d ' ')
+        download_required=$((bundle_bytes_expected + 536870912))
+        [ "$download_free" -ge "$download_required" ] || \
+            fail "download needs ${download_required} bytes free on /home; only ${download_free} are available"
         DOWNLOAD_DIR=$(mktemp -d /home/zarya/.cache/zarya-ota.XXXXXX)
         bundle="$DOWNLOAD_DIR/zarya-os-${version}-amd64.zup"
-        info "Downloading Zarya OS $version..."
+        info "Downloading Zarya OS $version ($((bundle_bytes_expected / 1024 / 1024)) MiB)..."
         curl --fail --location --retry 3 --retry-delay 2 \
             --header 'Accept: application/octet-stream' \
             --header 'User-Agent: zarya-ota/1' "$url" -o "$bundle"
+        [ "$(stat -c '%s' "$bundle")" = "$bundle_bytes_expected" ] || \
+            fail 'downloaded bundle size does not match GitHub Release metadata'
         install_bundle "$bundle" 0 "$reboot_after"
         ;;
     install)
